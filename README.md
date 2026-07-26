@@ -7,7 +7,8 @@
 
 - 对外唯一接口：`v5/mcp_server.py`（FastMCP，40 个 `v5_*` 工具）
 - 生命周期闭环：`hermes-plugin/ikaros_v5/`（Hermes `MemoryProvider`）
-- 依赖极小：仅 `chromadb` + `httpx` + `mcp` + `python-dotenv`
+- 依赖极小（Python 包）：仅 `chromadb` + `httpx` + `mcp` + `python-dotenv` + `psutil`。
+- **运行时二进制依赖**：语义检索（embedding）与可选本地聊天 LLM 都依赖 `llama.cpp` 的 `llama-server` 二进制。纯云端 + 英文关键词模式可跳过；**要启用中文语义检索，必须安装 llama.cpp 并启动 embedding 服务**（见「六、启用 embedding 语义检索」）。
 
 ---
 
@@ -69,6 +70,12 @@ v5-memory/
 ## 三、快速开始
 
 需要 Python ≥ 3.12。
+
+> **⚠️ 前置：安装 llama.cpp（启用语义检索必需）**
+> 中文（含向量）语义检索依赖 embedding 端点，而自托管 embedding 服务由 `llama.cpp` 的
+> `llama-server` 二进制提供。请先安装 llama.cpp（见「六、启用 embedding 语义检索」），
+> 并将其 `llama-server` 放入 `PATH`，或设置 `IKAROS_LLAMA_SERVER` 指向它。
+> 仅用纯云端 + 英文/数字关键词检索的用户可跳过此步。
 
 ```bash
 # 1) 创建 venv 并安装依赖 + 生成 MCP 配置片段
@@ -139,7 +146,29 @@ python install.py --hermes-agent "C:/path/to/hermes-agent"
 
 ---
 
-## 六、注意事项
+## 六、启用 embedding 语义检索（安装 llama.cpp）
+
+V5 的语义检索（向量召回）需要一个 `/embedding` 端点。本仓库自带自托管方案，依赖 **llama.cpp** 的 `llama-server` 二进制。其他用户部署时请先安装它：
+
+1. **下载 llama.cpp 预编译二进制**
+   - Windows：到 [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 下载含 `llama-server` 的包（如 `llama-server-bin-win-cuda-cu12.x` 带 GPU 加速，或 CPU 版），解压得到 `llama-server.exe`。
+   - Linux / macOS：`brew install llama.cpp`，或下载 release 中的 `llama-server`，或 `cmake` 自行编译。
+2. **放入 PATH 或设环境变量**
+   - 把 `llama-server`（或 `llama-server.exe`）所在目录加入系统 `PATH`；或
+   - 设置 `IKAROS_LLAMA_SERVER` 指向其完整路径：
+     - Windows：`set IKAROS_LLAMA_SERVER=C:\tools\llama.cpp\llama-server.exe`
+     - Linux/macOS：`export IKAROS_LLAMA_SERVER=/usr/local/bin/llama-server`
+3. **下载 embedding 模型并启动服务**
+   ```bash
+   python models/download_models.py --only embed   # 取得 nomic-embed-text-v2-moe.f16.gguf
+   python models/serve_embeddings.py                # 监听 127.0.0.1:8587/embedding
+   ```
+4. **让 V5 指向该端点**（`install.py` 生成的配置已默认指向 `http://127.0.0.1:8587/embedding`）：
+   设置 `IKAROS_EMBED_URL=http://127.0.0.1:8587/embedding`。
+
+> 同一份 `llama-server` 也用于**可选**的本地聊天 LLM（`:8080`，懒加载）。纯云端部署（认知/整合走 DeepSeek）可只装 embedding 用的 `llama-server`，不启本地聊天模型。
+
+## 七、注意事项
 
 - **模型文件不入库**：`.gguf` 体积数 GB，请用 `models/download_models.py` 下载或自行放入。
 - **embedding 端点是语义检索的前提**：不配置 `IKAROS_EMBED_URL` 时，向量召回会降级（仅关键词/FTS5 命中），不影响基础记忆读写。
@@ -149,7 +178,7 @@ python install.py --hermes-agent "C:/path/to/hermes-agent"
 
 ---
 
-## 七、与原 Ikaros 工程的关系
+## 八、与原 Ikaros 工程的关系
 
 本仓库是从 Ikaros 主工程 `core/v5/` 抽离出的**干净副本**，所有 `E:\Ikaros` / `core/v5` /
 `hermes-agent` 等硬编码路径已改为相对路径或环境变量驱动，可独立部署在任意机器。
