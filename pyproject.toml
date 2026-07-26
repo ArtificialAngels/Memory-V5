@@ -1,0 +1,22 @@
+[project]
+name = "ikaros-memory-v5"
+version = "5.1.0"
+description = "Ikaros V5 long-term memory architecture as a standalone memory plugin (MCP server + Hermes Agent provider)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=0.5.0",
+    "httpx>=0.27.0",
+    "mcp>=1.2.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+ikaros-mem-v5 = "v5.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["v5*"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

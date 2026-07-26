@@ -1,0 +1,92 @@
+# V5.2 思考前处理工厂 — 阈值配置
+# spec 4.2: 所有阈值集中在此, 不在代码里写死. 修改本文件即时生效(进程重启后重载).
+
+rhythm:
+  tz_offset: 8            # 本地时区偏移 (小时), 中国 UTC+8. 也可用 env IKAROS_TZ_OFFSET 覆盖
+  inject_when_recent: true
+
+memory_retrieval:
+  vector_weight: 0.7      # 向量语义分权重
+  fts_weight: 0.3         # FTS5 关键词分权重
+  time_decay_per_day: 0.05
+  min_fused_score: 0.3    # 融合分阈值, 低于此不注入 (2026-07-26 重新标定: nomic-embed-text-v2-moe 的余弦距离下, 真实语义匹配 fused≈0.3~0.5, 噪声≈0.15; 原 0.6 会把所有有效召回过滤掉导致语义召回失效)
+  top_k: 5
+  type_boost:
+    emotion: 1.2          # 情感记忆优先
+    fact: 1.1
+    user_trait: 1.15      # 对哥哥的理解优先 (V5 新增)
+    preference: 1.05
+    conversation: 0.8
+    default: 1.0
+
+summary:
+  trigger_rounds: 20      # 历史轮次超过此值才压缩旧轮
+  reuse_rounds: 10        # N 轮内复用上次摘要
+  max_age_rounds: 30      # 摘要超过此轮数旧则丢弃
+  model: local-llm
+  max_sentences: 3
+  timeout_s: 5
+
+relationship:
+  confidence_gate: 0.7     # 置信度低于此不注入
+  inject_on_signal: true
+
+emotion:
+  label_model: local-llm
+  max_tags: 2
+  diff_inject: true
+  diff_threshold: 0.3      # |ΔP|+|ΔA|+|ΔD| 超过才注差异句
+  debounce_seconds: 5       # spec 4.1: 5s 内不重复注
+  timeout_s: 5
+  tag_vocab:                # 受控词表, 约束本地 LLM 输出便于检索
+    - 开心
+    - 愉悦
+    - 平静
+    - 低落
+    - 难过
+    - 焦虑
+    - 专注
+    - 期待
+    - 温柔
+    - 害羞
+    - 满足
+    - 生气
+    - 困惑
+    - 怀旧
+    - 无聊
+
+token_budget:
+  min: 800
+  max: 1200
+  char_x: 1.0              # 安全系数: 中文~1token/字, 其他~0.5token/字符 (非 spec 字面×2, 避免中文误裁)
+
+# 运行时内存缓存 (性能优化, 非 spec 项)
+# 效果: 削 embedding 忙时尖峰(~1s) + 进程冷启动 chroma 重开(850ms); 同 session 重复 query 命中缓存
+cache:
+  embedding_enabled: true
+  embedding_max: 512           # LRU 容量 (进程级, 跨 session 共享)
+  vector_index_singleton: true # 复用 chroma 客户端, 不再每轮重开
+  vector_refresh_seconds: 30   # 最多 30s 重开一次, 拾取反思循环等外部新增记忆
+  retrieve_ttl_seconds: 20     # 检索结果短 TTL: 同 query 20s 内直接返回, 跳过 embedding+chroma
+  retrieve_ttl_enabled: true
+
+# Validation rules (v5.validation module)
+# Each rule can be individually enabled/disabled.
+# Rules check input format, type, range, and consistency.
+validation:
+  input:
+    not_empty: {enabled: true}
+    max_length: {enabled: true}
+  memory:
+    not_empty: {enabled: true}
+    max_length: {enabled: true}
+    allowed_type: {enabled: true}
+    weight_range: {enabled: true}
+    pad_range: {enabled: true}
+  query:
+    not_empty: {enabled: true}
+    query_min_length: {enabled: true}
+    max_length: {enabled: true}
+  entity:
+    not_empty: {enabled: true}
+    entity_type: {enabled: true}

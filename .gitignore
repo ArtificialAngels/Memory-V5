@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime data (user memory, generated at runtime — never commit)
+data/
+*.db
+chroma/
+
+# Secrets / local env
+.env
+
+# Model binaries (downloaded separately via models/download_models.py)
+*.gguf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp

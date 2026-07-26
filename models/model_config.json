@@ -1,0 +1,11 @@
+{
+  "initial_model": "Qwen_Qwen3-1.7B-Q4_K_M.gguf",
+  "alias": "local-llm",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "ctx_size": 8192,
+  "gpu_layers": "auto",
+  "flash_attn": "auto",
+  "cont_batching": true,
+  "jinja": true
+}
