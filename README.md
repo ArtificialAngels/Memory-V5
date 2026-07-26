@@ -2,8 +2,9 @@
 
 **Ikaros V5 长期记忆架构 —— 独立记忆插件。**
 
-把 V5 的记忆引擎抽离成一个**不依赖 Ikaros 主工程**的独立仓库，便于在全新下载的
-干净 [Hermes Agent](https://www.codebuddy.cn) 上通过 **MCP 服务器 + Agent Provider 插件** 两种方式接入长期记忆。
+ V5 的记忆引擎是从** Ikaros 主工程**的抽离成独立模组
+供给[Hermes Agent]使用
+通过 **MCP 服务器 + Agent Provider 插件** 两种方式接入长期记忆。
 
 - 对外唯一接口：`v5/mcp_server.py`（FastMCP，40 个 `v5_*` 工具）
 - 生命周期闭环：`hermes-plugin/ikaros_v5/`（Hermes `MemoryProvider`）
@@ -175,11 +176,3 @@ V5 的语义检索（向量召回）需要一个 `/embedding` 端点。本仓库
 - **中文语义检索建议开启 embedding 服务**：FTS5 默认使用 `unicode61` 分词器，对中文按整段而非分词处理，纯关键词路径对中文召回较弱；`models/serve_embeddings.py`（`:8587`）提供向量语义召回，能正确匹配"意思相近"的中文记忆。英文 / 数字（如 `Rust`）关键词检索不受影响。
 - **本地 LLM 是可选的**：仅当使用 `provider="local"` 路径时才需要 `llama-server` + 聊天模型；默认认知/整合走云端（设 `DEEPSEEK_API_KEY`）。
 - **纯 Python 标准库存储**：SQLite + Chroma 都在本地，数据归用户所有。
-
----
-
-## 八、与原 Ikaros 工程的关系
-
-本仓库是从 Ikaros 主工程 `core/v5/` 抽离出的**干净副本**，所有 `E:\Ikaros` / `core/v5` /
-`hermes-agent` 等硬编码路径已改为相对路径或环境变量驱动，可独立部署在任意机器。
-Ikaros 主工程本身的 `core/v5/` 不受影响。
