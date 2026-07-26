@@ -3,8 +3,10 @@
 **Ikaros V5 长期记忆架构 —— 独立记忆插件。**
 
  V5 的记忆引擎是从** Ikaros 主工程**的抽离成独立模组
-供给[Hermes Agent]使用
+
 通过 **MCP 服务器 + Agent Provider 插件** 两种方式接入长期记忆。
+
+优先适配Hermes Agent
 
 - 对外唯一接口：`v5/mcp_server.py`（FastMCP，40 个 `v5_*` 工具）
 - 生命周期闭环：`hermes-plugin/ikaros_v5/`（Hermes `MemoryProvider`）
