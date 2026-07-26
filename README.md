@@ -5,7 +5,7 @@
 把 V5 的记忆引擎抽离成一个**不依赖 Ikaros 主工程**的独立仓库，便于在全新下载的
 干净 [Hermes Agent](https://www.codebuddy.cn) 上通过 **MCP 服务器 + Agent Provider 插件** 两种方式接入长期记忆。
 
-- 对外唯一接口：`v5/mcp_server.py`（FastMCP，41 个 `v5_*` 工具）
+- 对外唯一接口：`v5/mcp_server.py`（FastMCP，40 个 `v5_*` 工具）
 - 生命周期闭环：`hermes-plugin/ikaros_v5/`（Hermes `MemoryProvider`）
 - 依赖极小：仅 `chromadb` + `httpx` + `mcp` + `python-dotenv`
 
@@ -39,7 +39,7 @@ V5 不是简单的"把对话塞进向量库"，而是一套**受控、可解释�
 ```
 v5-memory/
 ├── v5/                     # V5 记忆引擎包（核心，可移植）
-│   ├── mcp_server.py       # MCP 服务器入口（41 个 v5_* 工具）
+│   ├── mcp_server.py       # MCP 服务器入口（40 个 v5_* 工具）
 │   ├── cli.py              # 控制台入口 ikaros-mem-v5
 │   ├── store.py            # SQLite FTS5 存储
 │   ├── search.py           # 三路融合检索 + 向量索引
@@ -143,6 +143,7 @@ python install.py --hermes-agent "C:/path/to/hermes-agent"
 
 - **模型文件不入库**：`.gguf` 体积数 GB，请用 `models/download_models.py` 下载或自行放入。
 - **embedding 端点是语义检索的前提**：不配置 `IKAROS_EMBED_URL` 时，向量召回会降级（仅关键词/FTS5 命中），不影响基础记忆读写。
+- **中文语义检索建议开启 embedding 服务**：FTS5 默认使用 `unicode61` 分词器，对中文按整段而非分词处理，纯关键词路径对中文召回较弱；`models/serve_embeddings.py`（`:8587`）提供向量语义召回，能正确匹配"意思相近"的中文记忆。英文 / 数字（如 `Rust`）关键词检索不受影响。
 - **本地 LLM 是可选的**：仅当使用 `provider="local"` 路径时才需要 `llama-server` + 聊天模型；默认认知/整合走云端（设 `DEEPSEEK_API_KEY`）。
 - **纯 Python 标准库存储**：SQLite + Chroma 都在本地，数据归用户所有。
 
