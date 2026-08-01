@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger("ikaros.v5.task_runner")
 
-V5_ROOT = Path(__file__).resolve().parent.parent  # Ikaros-memory/
+V5_ROOT = Path(__file__).resolve().parent  # Ikaros-memory/
 _TASK_DIR = V5_ROOT / "data" / "v5"
 _RESULT_PATH = _TASK_DIR / "task_result.json"
 _PENDING_PATH = _TASK_DIR / "task_pending.json"
@@ -53,16 +53,18 @@ def call_async(text: str, optimized: Optional[str] = None) -> dict:
 
 
 def _resolve_hermes() -> Optional[str]:
-    """稳健定位 hermes 可执行文件：优先 PATH (shutil.which)。
+    """稳健定位 hermes.exe: 优先 PATH (shutil.which), 回退项目 venv.
 
-    standalone 下运行于 hermes-agent 内部, hermes 已在 PATH 上；
-    不再硬编码任何项目专属的 venv 路径。
+    Hermes 已归位 core/hermes (原 hermes-agent). 主路径走 PATH 解析,
+    次选回退 core/hermes/venv/Scripts/hermes.exe。
     """
     import shutil as _shutil
     _cand = _shutil.which("hermes.exe") or _shutil.which("hermes")
     if _cand and Path(_cand).is_file():
         return _cand
-    # standalone 不硬编码 hermes-agent 路径 (运行于 hermes-agent 内, 走 PATH)；找不到返回 None
+    _fallback = Path(__file__).resolve().parent.parent / "hermes" / "venv" / "Scripts" / "hermes.exe"
+    if _fallback.is_file():
+        return str(_fallback)
     return None
 
 
@@ -87,7 +89,7 @@ def _execute_async(task_id: str, text: str, optimized: Optional[str]) -> None:
         _result = _sp.run(
             [_hermes, "chat", "-q", goal, "--max-turns", "3", "--pass-session-id"],
             capture_output=True, text=True, timeout=300,
-            cwd=str(V5_ROOT),
+            cwd=str(Path(__file__).resolve().parent),
         )
 
         # 捕获 Hermes 子代理 session_id
@@ -221,7 +223,7 @@ def resume_sub_session(session_id: str, extra_prompt: str = "") -> str | None:
         if extra_prompt:
             _args += ["-q", extra_prompt]
         _result = _sp.run(_args, capture_output=True, text=True, timeout=60,
-                          cwd=str(V5_ROOT))
+                          cwd=str(Path(__file__).resolve().parent))
         if _result.returncode == 0:
             return _result.stdout.strip() or None
     except Exception:

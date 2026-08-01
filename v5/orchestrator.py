@@ -15,15 +15,16 @@ logger = logging.getLogger("ikaros.v5.orchestrator")
 
 # ── Path bootstrap ──────────────────────────────────────────────────────────
 # orchestrator.py lives in Ikaros-memory/v5/  -> V5_ROOT = Ikaros-memory/
-V5_ROOT = Path(__file__).resolve().parent.parent
-if str(V5_ROOT) not in sys.path:
-    sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+if str(V5_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(V5_ROOT.parent))
 
-# IKAROS_ROOT: 可选覆盖。standalone 下默认即仓库根 (V5_ROOT)。
-IKAROS_ROOT = Path(os.environ.get("IKAROS_ROOT", str(V5_ROOT)))
-# Ikaros 中 bin/ 含 cloud_chat / wd_import 等；standalone 不存在则跳过 (companion 委派会优雅降级)。
+# IKAROS_ROOT (set by Ikaros-environment or inferred from directory structure)
+# orchestrator.py is at core/memory_v5/v5/orchestrator.py → V5_ROOT = core/memory_v5/
+# Ikaros project root = V5_ROOT.parent.parent (after 2026-07-24 normalization)
+IKAROS_ROOT = Path(os.environ.get("IKAROS_ROOT", str(V5_ROOT.parent.parent)))
 _BIN_DIR = IKAROS_ROOT / "bin"
-if _BIN_DIR.is_dir() and str(_BIN_DIR) not in sys.path:
+if str(_BIN_DIR) not in sys.path:
     sys.path.insert(0, str(_BIN_DIR))
 
 
@@ -202,6 +203,14 @@ def _think(user_text: str) -> tuple[str | None, dict]:
         'If no tool is relevant, respond {"tool": null}. '
         "Do not add any explanation or markdown fences."
     )
+    # Inject contextually relevant operation rules (semantic retrieval via :8587)
+    try:
+        from v5.rules_retriever import retrieve_relevant_rules
+        rules_block = retrieve_relevant_rules(user_text)
+        if rules_block:
+            system += "\n\n" + rules_block
+    except Exception:
+        pass
     raw = local_llm_chat(system, user_text, max_tokens=300, temperature=0.1)
     obj = _parse_json_obj(raw)
     if not obj:

@@ -14,7 +14,7 @@ import psutil
 
 logger = logging.getLogger("ikaros.v5.vitality")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
+V5_ROOT = Path(__file__).resolve().parent
 _VITALITY_PATH = V5_ROOT / "data" / "v5" / "vitality.json"
 
 # 参数 (可调, 基于人体精力代谢类比)

@@ -9,7 +9,7 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.v5.summary")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
+V5_ROOT = Path(__file__).resolve().parent
 _CACHE_PATH = V5_ROOT / "data" / "v5" / "summary_cache.json"
 
 _COMPRESS_SYSTEM = (

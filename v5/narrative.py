@@ -11,8 +11,8 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.v5.narrative")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(V5_ROOT.parent))
 
 _NARRATIVE_SYSTEM = """你是伊卡洛斯, 人造天使。你在写这个月的"人生叙事" — 一个连贯的自我认识。
 

@@ -10,7 +10,7 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.v5.profile")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
+V5_ROOT = Path(__file__).resolve().parent
 DATA_DIR = V5_ROOT / "data" / "v5"
 PROFILE_PATH = DATA_DIR / "profile.json"
 

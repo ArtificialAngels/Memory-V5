@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 # 检测器集持久化路径: 让 AIS 负选择/克隆演化跨进程累积 (而非每次新建重置)
-_V5_ROOT = Path(__file__).resolve().parent.parent  # Ikaros-memory/
+_V5_ROOT = Path(__file__).resolve().parent  # Ikaros-memory/
 _AIS_PATH = _V5_ROOT / "data" / "v5" / "ais_detectors.json"
 
 # 内联说明见 docs/scripts/core/v5/v5/drivers.md（见“内联注释摘录”）

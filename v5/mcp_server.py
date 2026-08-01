@@ -107,6 +107,8 @@ from v5.tools import (  # noqa: E402
     v5_directive_stats,
     # V5.3: activity perception + context compression engine
     v5_activity_status, v5_context_compression_stats,
+    # V5.4: project track
+    v5_project_note, v5_project_retrieve, v5_project_stats,
 )
 
 _NEW_V5_TOOLS = [
@@ -130,6 +132,8 @@ _NEW_V5_TOOLS = [
     v5_directive_stats,
     # V5.3: activity perception + context compression engine
     v5_activity_status, v5_context_compression_stats,
+    # V5.4: project track
+    v5_project_note, v5_project_retrieve, v5_project_stats,
 ]
 for _tool_fn in _NEW_V5_TOOLS:
     try:

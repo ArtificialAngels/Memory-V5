@@ -15,7 +15,7 @@ logger = logging.getLogger("ikaros.v5.affect")
 
 # ─── 默认路径 ─────────────────────────────────────────────────────
 
-V5_ROOT = Path(__file__).resolve().parent.parent  # Ikaros-memory/
+V5_ROOT = Path(__file__).resolve().parent  # Ikaros-memory/
 _AFFECT_PATH = V5_ROOT / "data" / "v5" / "affect.json"
 
 # ─── 基线 ─────────────────────────────────────────────────────────

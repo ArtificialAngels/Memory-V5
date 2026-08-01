@@ -11,7 +11,7 @@ from pathlib import Path
 
 logger = logging.getLogger("ikaros.v5.relationship")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
+V5_ROOT = Path(__file__).resolve().parent
 _REL_PATH = V5_ROOT / "data" / "v5" / "relationship.json"
 
 # 参数

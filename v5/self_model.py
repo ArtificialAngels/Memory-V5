@@ -14,9 +14,9 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.v5.self_model")
 
-V5_ROOT = Path(__file__).resolve().parent.parent  # Ikaros-memory/
-if str(V5_ROOT) not in sys.path:
-    sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent  # Ikaros-memory/
+if str(V5_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(V5_ROOT.parent))
 
 from v5 import validate_state_key  # 受控 state key 校验 (定义于 v5.__init__)
 

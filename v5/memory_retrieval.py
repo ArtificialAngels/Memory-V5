@@ -110,7 +110,7 @@ def retrieve(
     # ── 去重合并 (按 id) ──
     merged: dict[str, dict] = {}
 
-    def _add(mid, content, mtype, weight, created, pad_p, pad_a, source, raw):
+    def _add(mid, content, mtype, weight, created, pad_p, pad_a, source, raw, **extra):
         key = str(mid)
         if key in merged:
             # 同一记忆多路命中 → 累加分量 (0.7 向量分量 + 0.3 FTS5 分量 = 融合分)
@@ -120,22 +120,44 @@ def retrieve(
             "id": key, "content": content, "type": mtype, "weight": weight,
             "tags": "", "created": created, "pad_p": pad_p, "pad_a": pad_a,
             "source": source, "raw": raw,
+            # 阶段 4: 频率/反馈字段透传 (排序用; 未暴露时默认 0)
+            "access_count": int(extra.get("access_count", 0)),
+            "reinforcement": float(extra.get("reinforcement", 0.0)),
+            "last_accessed": float(extra.get("last_accessed", 0.0)),
+            "long_term": bool(extra.get("long_term", False)),
         }
 
     for i, m in enumerate(fts_list):
         _add(m.id, m.content, m.type, m.weight, m.created,
-             getattr(m, "pad_p", 0.0), getattr(m, "pad_a", 0.0), "fts", fw * (1.0 / (i + 1)))
+             getattr(m, "pad_p", 0.0), getattr(m, "pad_a", 0.0), "fts", fw * (1.0 / (i + 1)),
+             access_count=getattr(m, "access_count", 0),
+             reinforcement=getattr(m, "reinforcement", 0.0),
+             last_accessed=getattr(m, "last_accessed", 0.0),
+             long_term=getattr(m, "long_term", False))
     for r in vec_list:
         _add(r.get("id"), r.get("content", ""), r.get("type", "fact"),
              r.get("weight", 0.5), r.get("created", 0.0),
-             r.get("pad_p", 0.0), r.get("pad_a", 0.0), "vec", vw * float(r.get("score", 0.0)))
+             r.get("pad_p", 0.0), r.get("pad_a", 0.0), "vec", vw * float(r.get("score", 0.0)),
+             access_count=r.get("access_count", 0),
+             reinforcement=r.get("reinforcement", 0.0),
+             last_accessed=r.get("last_accessed", 0.0),
+             long_term=r.get("long_term", False))
     for m in time_list:
         # 时间指代命中是用户明确信号, 给强初始分确保过 min_fused 阈值
         _add(m.id, m.content, m.type, m.weight, m.created,
-             getattr(m, "pad_p", 0.0), getattr(m, "pad_a", 0.0), "time", 1.0)
+             getattr(m, "pad_p", 0.0), getattr(m, "pad_a", 0.0), "time", 1.0,
+             access_count=getattr(m, "access_count", 0),
+             reinforcement=getattr(m, "reinforcement", 0.0),
+             last_accessed=getattr(m, "last_accessed", 0.0),
+             long_term=getattr(m, "long_term", False))
 
-    # ── 融合分: 时间衰减 + 类型 boost ──
+    # ── 融合分: 时间衰减 + 类型 boost + 频率/反馈 boost ──
     now = time.time()
+    # 阶段 4: 频率/反馈权重 (借鉴 cognee apply_feedback_weights; config 可关可调)
+    fw_cfg = float(mr.get("frequency_weight", 0.0))
+    rw_cfg = float(mr.get("reinforcement_weight", 0.0))
+    frs_cfg = float(mr.get("freshness_weight", 0.0))
+    lt_cfg = float(mr.get("long_term_boost", 0.0))
     excl = [e for e in (exclude or []) if e]
     out: list[dict] = []
     for item in merged.values():
@@ -148,6 +170,22 @@ def retrieve(
                 fused *= max(0.2, 1.0 - decay * days)  # 下限 0.2, 不归零
         b = boosts.get(item["type"], boosts.get("default", 1.0))
         fused *= b
+        # 频率/反馈/新鲜度/永久库 boost (纯加分, 不影响 0 分记忆)
+        if fused > 0 and (fw_cfg or rw_cfg or frs_cfg or lt_cfg):
+            boost = 0.0
+            ac = int(item.get("access_count", 0))
+            if fw_cfg and ac > 0:
+                # log2(ac+1) 近似用 bit_length; cap +0.25
+                boost += min(0.25, (ac + 1).bit_length() * fw_cfg)
+            if rw_cfg and item.get("reinforcement", 0.0) > 0:
+                boost += min(0.15, float(item["reinforcement"]) * rw_cfg)
+            if frs_cfg and item.get("last_accessed", 0.0) > 0 and \
+                    (now - float(item["last_accessed"])) < 7 * 86400.0:
+                boost += frs_cfg
+            if lt_cfg and item.get("long_term"):
+                boost += lt_cfg
+            if boost:
+                fused *= (1.0 + boost)
         item["score"] = fused
         # 去重已知信息 (子串重叠)
         if excl:
@@ -182,6 +220,191 @@ def retrieve(
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# 统一检索路由层 (unified_retrieve) —— 借鉴 cognee recall 的 auto scope 蓝图.
+# V5 已有 5 个独立检索器 (semantic 三路融合 / lexical FTS / graph 扩散 /
+# tree 树域加权 / vault 关键词), 这里提供唯一入口 + 自动路由 + 空则回退,
+# 调用方 (memory_api / conversation-tree / 未来 agent 检索) 不再各自拼装.
+# 全部 fail-open: 任一路异常静默跳过, 不阻塞; 返回统一归一化 dict.
+# ─────────────────────────────────────────────────────────────────────────
+SCOPES = ("auto", "semantic", "lexical", "graph", "tree", "temporal")
+
+# 统一归一化字段 (与 retrieve() 返回一致 + source 标记来源)
+_REQ_FIELDS = ("id", "content", "type", "weight", "tags", "created",
+               "pad_p", "pad_a", "source", "score")
+
+
+def _norm(d: dict) -> dict:
+    """把任意路检索结果归一化成统一字段 (缺省补默认值)."""
+    return {
+        "id": str(d.get("id", "")),
+        "content": d.get("content", "") or "",
+        "type": d.get("type", "fact"),
+        "weight": float(d.get("weight", 0.5) or 0.5),
+        "tags": d.get("tags", "") or "",
+        "created": float(d.get("created", 0.0) or 0.0),
+        "pad_p": float(d.get("pad_p", 0.0) or 0.0),
+        "pad_a": float(d.get("pad_a", 0.0) or 0.0),
+        "source": d.get("source", "semantic"),
+        "score": float(d.get("score", 0.0) or 0.0),
+    }
+
+
+def _route_cfg() -> dict:
+    try:
+        from v5 import preprocess_config as pc
+        return pc.cfg().get("memory_retrieval", {})
+    except Exception:
+        return {}
+
+
+def unified_retrieve(
+    query: str,
+    *,
+    top_k: int | None = None,
+    scope: str = "auto",
+    node_id: str | None = None,
+    tree=None,
+    character: str = "",
+    time_range: tuple[float, float] | None = None,
+    exclude: list[str] | None = None,
+    min_weight: float = 0.0,
+) -> list[dict]:
+    """统一检索入口 (对应 cognee recall). scope 自动路由, 空则回退语义.
+
+    scope:
+      - "auto"     (默认): 语义三路融合 → 结果 <3 时补图扩散路 → 仍不足走 Vault (retrieve 内置)
+      - "semantic": 等价现有 retrieve() (三路融合 + Vault fallback)
+      - "lexical" : 仅 FTS5 关键词, 空则回退 semantic
+      - "graph"   : 仅实体图扩散激活, 空则回退 semantic
+      - "tree"    : 树域加权检索 (需 node_id + tree 对象; tree 缺失自动降级 auto)
+      - "temporal": 时间过滤检索 (阶段 5 接线后可用; 当前降级 semantic)
+    返回: 按 score 降序的统一归一化 list[dict], source ∈ semantic/lexical/graph/tree/vault.
+    """
+    if not query or not query.strip():
+        return []
+    if scope not in SCOPES:
+        scope = "auto"
+    mr = _route_cfg()
+    auto_route = bool(mr.get("auto_route", True))
+    tk = int(top_k or mr.get("top_k", 5) or 5)
+    graph_min = float(mr.get("graph_min_score", 0.2) or 0.2)
+    merged: dict[str, dict] = {}
+    used: list[str] = []
+
+    def _merge(items: list[dict], src: str) -> None:
+        if not items:
+            return
+        for it in items:
+            d = _norm(it)
+            d["source"] = src
+            key = d["id"]
+            if not key:
+                continue
+            if key in merged:
+                # 多路命中: 取最高分 (不累加, 避免 graph 低分稀释 semantic 高分)
+                if d["score"] > merged[key]["score"]:
+                    merged[key] = d
+            else:
+                merged[key] = d
+
+    # ── 显式 scope 优先 ──
+    if scope == "lexical":
+        try:
+            from v5 import store
+            hits = store.search(query, top_k=tk, min_weight=min_weight, character=character)
+            for i, m in enumerate(hits):
+                _merge([_norm({
+                    "id": str(m.id), "content": m.content, "type": m.type,
+                    "weight": m.weight, "tags": getattr(m, "tags", ""),
+                    "created": m.created, "pad_p": getattr(m, "pad_p", 0.0),
+                    "pad_a": getattr(m, "pad_a", 0.0),
+                    "score": 0.3 * (1.0 / (i + 1)),
+                })], "lexical")
+            used.append("lexical")
+        except Exception as e:
+            logger.debug("unified lexical failed: %s", e)
+        if not merged:
+            return unified_retrieve(query, top_k=tk, scope="semantic",
+                                    character=character, time_range=time_range,
+                                    exclude=exclude, min_weight=min_weight)
+
+    elif scope == "graph":
+        try:
+            from v5.search import entity_graph_search
+            _merge(entity_graph_search(query, top_k=tk * 2), "graph")
+            used.append("graph")
+        except Exception as e:
+            logger.debug("unified graph failed: %s", e)
+        if not merged:
+            return unified_retrieve(query, top_k=tk, scope="semantic",
+                                    character=character, time_range=time_range,
+                                    exclude=exclude, min_weight=min_weight)
+
+    elif scope == "tree":
+        if tree is not None and node_id:
+            try:
+                from v5.extensions.tree_adapter import tree_scoped_retrieve
+                _merge(tree_scoped_retrieve(tree, node_id, query, top_k=tk,
+                                            character=character), "tree")
+                used.append("tree")
+            except Exception as e:
+                logger.debug("unified tree failed: %s", e)
+            if merged:
+                return _finish(merged, tk)
+        # tree 不可用 → 降级 auto (保持树端调用行为不崩)
+        return unified_retrieve(query, top_k=tk, scope="auto", character=character,
+                                time_range=time_range, exclude=exclude,
+                                min_weight=min_weight)
+
+    elif scope == "temporal":
+        # 阶段 5: temporal_graph.retrieve_temporal —— 过滤 valid_to 已失效的事实
+        try:
+            from v5.extensions.temporal_graph import retrieve_temporal
+            _merge(retrieve_temporal(query, top_k=tk * 2, character=character,
+                                     time_range=time_range, exclude=exclude,
+                                     min_weight=min_weight), "temporal")
+            used.append("temporal")
+        except Exception as e:
+            logger.debug("unified temporal failed: %s", e)
+        if merged:
+            return _finish(merged, tk)
+        return unified_retrieve(query, top_k=tk, scope="semantic", character=character,
+                                time_range=time_range, exclude=exclude,
+                                min_weight=min_weight)
+
+    # ── auto / semantic ──
+    sem: list = []
+    try:
+        sem = retrieve(query, top_k=tk, time_range=time_range, exclude=exclude,
+                       min_weight=min_weight, character=character)
+    except Exception as e:
+        logger.debug("unified semantic failed: %s", e)
+    _merge(sem, "semantic")
+    used.append("semantic")
+    if scope == "semantic" or not auto_route:
+        return _finish(merged, tk)
+
+    # ── auto 补路: semantic 不足时补图扩散 (低分 graph 不过 threshold) ──
+    if len(merged) < 3:
+        try:
+            from v5.search import entity_graph_search
+            g = entity_graph_search(query, top_k=tk * 2)
+            g = [x for x in g if float(x.get("score", 0.0)) >= graph_min]
+            _merge(g, "graph")
+            used.append("graph")
+        except Exception as e:
+            logger.debug("unified auto graph fallback failed: %s", e)
+    return _finish(merged, tk)
+
+
+def _finish(merged: dict[str, dict], tk: int) -> list[dict]:
+    """排序截断 (fail-open: merged 可能为空)."""
+    out = [v for v in merged.values() if v["score"] > 0]
+    out.sort(key=lambda x: -x["score"])
+    return out[:tk]
+
+
 # ─── ThirdSpace Vault fallback ─────────────────────────────────────
 # 当 V5 本体检索命中不足时, 轻量搜 vault 的 03-知识/ 和 02-日记/。
 # 不建索引, 不依赖 :8587, 纯关键词匹配（维护成本为零）。
@@ -200,10 +423,11 @@ def _get_vault_root() -> str | None:
     if env:
         _VAULT_ROOT = env
         return _VAULT_ROOT
-    # fallback: 仅在仓库同级的 data/thirdspace-vault 查找 (不依赖 Ikaros)
+    # fallback: 从 Ikaros 项目根推断
     try:
-        from pathlib import Path as _P
-        candidate = _P(__file__).resolve().parent.parent / "data" / "thirdspace-vault"
+        from pathlib import Path
+        p = Path(__file__).resolve().parent
+        candidate = p / "data" / "thirdspace-vault"
         if candidate.is_dir():
             _VAULT_ROOT = str(candidate)
     except Exception:

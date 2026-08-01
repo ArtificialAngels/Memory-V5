@@ -140,6 +140,14 @@ def _call_task_refiner(text: str, memory_context: str) -> Optional[str]:
         "}\n"
         "不要解释, 不要聊天, 只输出 JSON。"
     )
+    # Inject contextually relevant operation rules (semantic retrieval via :8587)
+    try:
+        from v5.rules_retriever import retrieve_relevant_rules
+        rules_block = retrieve_relevant_rules(text)
+        if rules_block:
+            system += "\n\n" + rules_block
+    except Exception:
+        pass
     user = f"原始指令: {text}"
     if memory_context:
         user += f"\n\n相关记忆:\n{memory_context}"

@@ -171,8 +171,8 @@ class VectorIndex:
             import chromadb
         except ImportError as e:
             raise ImportError(
-                "chromadb not installed. Install it into the venv that runs this package:\n"
-                "  pip install chromadb"
+                "chromadb not installed. Run via ikaros-mem.bat (uses portable-python) "
+                "or: E:\\Ikaros\\runtime\\portable-python\\python.exe -m pip install chromadb"
             ) from e
         self._persist_dir = Path(persist_dir or CHROMA_DIR)
         self._persist_dir.mkdir(parents=True, exist_ok=True)
@@ -347,13 +347,29 @@ def entity_graph_search(query: str, top_k: int = 5) -> list[dict]:
     """Entity graph spreading activation search.
     Matches query against entity graph and activates linked episodic memories.
     Returns list of episodic memory dicts with graph_score.
+
+    2026-08-01: 当 preprocess_config.yaml 的 cache.ontology_align_enabled=true 时,
+    实体候选走 extensions.ontology_align.find_entity_candidates_fuzzy
+    (exact/包含优先 + difflib 模糊补召回, 零 LLM 成本); 默认仍用原精确匹配.
     """
     try:
-        from v5.entity_graph import find_entity_candidates, spreading_activation_search
-        candidates = find_entity_candidates(query)
+        # 本体对齐开关: 读 config 的 cache.ontology_align_enabled (fail-open 关)
+        use_fuzzy = False
+        try:
+            from v5 import preprocess_config as pc
+            use_fuzzy = bool(pc.cfg().get("cache", {}).get("ontology_align_enabled", False))
+        except Exception:
+            pass
+        if use_fuzzy:
+            from v5.extensions.ontology_align import find_entity_candidates_fuzzy
+            candidates = find_entity_candidates_fuzzy(query, top_k=3)
+        else:
+            from v5.entity_graph import find_entity_candidates
+            candidates = find_entity_candidates(query)
         if not candidates:
             return []
         seeds = [(c.entity_id, c.similarity) for c in candidates[:5]]
+        from v5.entity_graph import spreading_activation_search
         episodic = spreading_activation_search(seeds, top_k=top_k)
         return [{
             "id": m.id, "content": m.summary, "type": "episodic",

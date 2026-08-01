@@ -537,6 +537,23 @@ def get(memory_id: int) -> Memory | None:
         return Memory.from_row(row) if row else None
 
 
+def get_batch(memory_ids: list[int]) -> dict[int, Memory]:
+    """Fetch multiple memories by id. Returns dict {id: Memory}.
+
+    Used by conversation_tree.get_context() for efficient batch context loading.
+    Missing ids are silently omitted from the result.
+    """
+    if not memory_ids:
+        return {}
+    with conn() as c:
+        placeholders = ",".join("?" * len(memory_ids))
+        rows = c.execute(
+            f"SELECT * FROM memory WHERE id IN ({placeholders})",
+            memory_ids,
+        ).fetchall()
+    return {row[0]: Memory.from_row(row) for row in rows}
+
+
 def _sanitize_fts5_query(query: str) -> str:
     """Sanitize a query string for FTS5 MATCH.
 

@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-V5_ROOT = Path(__file__).resolve().parent.parent
-if str(V5_ROOT) not in sys.path:
-    sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+if str(V5_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(V5_ROOT.parent))
 
 from v5 import store as _store
 
@@ -145,12 +145,13 @@ class V5MemoryAPI:
             except Exception:  # noqa: BLE001
                 return []
 
-        # 2) semantic fuse path
+        # 2) semantic fuse path (统一路由层: auto scope = 三路融合 + 图补路 + Vault)
         if fuse:
             try:
-                from v5.memory_retrieval import retrieve
+                from v5.memory_retrieval import unified_retrieve
                 tr = tuple(time_range) if time_range else None
-                fused = retrieve(query, top_k=top_k, time_range=tr, min_weight=0.0)
+                fused = unified_retrieve(query, top_k=top_k, scope="auto",
+                                         time_range=tr, min_weight=0.0)
 # 内联说明见 docs/scripts/core/v5/v5/memory_api.md（见“内联注释摘录”）
                 if fused:
                     return fused

@@ -16,7 +16,7 @@ from typing import Any, Iterator
 
 logger = logging.getLogger("ikaros.v5.entity_graph")
 
-EG_ROOT = Path(__file__).resolve().parent.parent
+EG_ROOT = Path(__file__).resolve().parent
 EG_DATA_DIR = EG_ROOT / "data" / "v5"
 EG_DB_PATH = EG_DATA_DIR / "v5.db"
 

@@ -10,7 +10,7 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.v5.proactive")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
+V5_ROOT = Path(__file__).resolve().parent
 _STATE_PATH = V5_ROOT / "data" / "v5" / "proactive_state.json"
 
 # 门控阈值
@@ -49,17 +49,11 @@ def _has_pending_task() -> bool:
 
 
 def _get_activity_idle() -> float:
-    """获取哥哥当前空闲秒数.
-
-    可选钩子: 若宿主运行时提供了 Ikaros 专属的 monitor_adapter
-    (services.monitor_adapter), 则优先用它获取真实空闲秒数; 否则回退到
-    data/v5/monitor_snapshot.json 快照; 都没有则返回 0.0.
-
-    services.monitor_adapter 是 Ikaros 运行时的专属模块, 在干净部署的
-    Hermes Agent 上可安全缺失 — 该依赖已被 try/except 优雅降级.
-    """
+    """从 monitor 获取当前空闲秒数."""
     try:
-        from services.monitor_adapter import get_current_idle  # 可选: 仅 Ikaros 运行时提供
+        import sys
+        sys.path.insert(0, str(V5_ROOT.parent))
+        from services.monitor_adapter import get_current_idle
         return get_current_idle()
     except Exception:
         try:

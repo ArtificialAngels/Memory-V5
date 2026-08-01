@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 import sys
 import time
@@ -12,32 +11,28 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.v5.self_discovery")
 
-# 项目根 (standalone: v5-memory/ ; 也接受 IKAROS_ROOT 覆盖)
-V5_ROOT = Path(__file__).resolve().parent.parent  # v5-memory/ (repo root)
-if str(V5_ROOT) not in sys.path:
-    sys.path.insert(0, str(V5_ROOT))
-IKAROS_ROOT = os.environ.get("IKAROS_ROOT")
-# hermes 可执行文件：仅在显式给出 IKAROS_ROOT 且 hermes-agent 存在时使用 (standalone 走 PATH)
-HERMES_EXE = None
-if IKAROS_ROOT:
-    _he = Path(IKAROS_ROOT) / "hermes-agent" / "venv" / "Scripts" / "hermes.exe"
-    if _he.is_file():
-        HERMES_EXE = _he
+# 项目根
+IKAROS_ROOT = Path(__file__).resolve().parent.parent.parent  # resolves to Ikaros repo root (core/memory_v5/ -> core/ -> root)
+sys.path.insert(0, str(IKAROS_ROOT / "core"))
+HERMES_EXE = IKAROS_ROOT / "core" / "hermes" / "venv" / "Scripts" / "hermes.exe"
 
 # 每次读哪些文件来了解自己
 _SELF_DISCOVERY_SOURCES = [
+    "AGENTS.md",
     "README.md",
-    "v5/self_model.py",
-    "v5/metacog.py",
+    "ikaros-identity/axiom.md",
+    "docs/hermes-agent-full-survey.md",
+    "docs/v5-architecture-review.md",
+    "Ikaros-memory/v5/self_model.py",
+    "Ikaros-memory/v5/metacog.py",
 ]
 
 
 def _read_sources() -> str:
     """从关键文件取摘要, 了解自己的真实架构."""
-    base = Path(os.environ.get("IKAROS_ROOT", str(V5_ROOT)))
     blocks: list[str] = []
     for rel in _SELF_DISCOVERY_SOURCES:
-        p = base / rel
+        p = IKAROS_ROOT / rel
         if p.is_file():
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")

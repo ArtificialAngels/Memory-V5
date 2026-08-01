@@ -11,8 +11,8 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.v5.dissonance")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(V5_ROOT.parent))
 
 # 只对 fact/preference 类记忆做失调检测 (identity 太核心, 先不做)
 _CHECK_TYPES = {"fact", "preference"}
@@ -120,7 +120,13 @@ def _nli_check(old_text: str, new_text: str) -> str | None:
 
 
 def _record_dissonance(new_content: str, conflicts: list[dict]) -> None:
-    """记录认知失调事件到 V4."""
+    """记录认知失调事件到 V4, 并执行两件后续 (阶段 4/5):
+
+    1) 阶段 4: 被矛盾替代的旧记忆降低 reinforcement (防反复召回冲突内容);
+    2) 阶段 5: 接 temporal_graph supersede —— 把每条 NLI 判定矛盾的旧事实
+       valid_to 置为当前时间 (时间戳失效, 非删除), 让 retrieve_temporal /
+       filter_expired_episodic 不再召回过期事实。
+    """
     try:
         from v5 import store as store
         old_summaries = "; ".join(
@@ -136,6 +142,33 @@ def _record_dissonance(new_content: str, conflicts: list[dict]) -> None:
             weight=0.8,
             tags="v5,dissonance",
         )
+
+        # 阶段 4: reinforcement 降权 (下限 -2.0, 防止反复召回已被推翻的内容)
+        try:
+            with store.conn() as c:
+                for cf in conflicts:
+                    oid = cf.get("old_id")
+                    if oid is None:
+                        continue
+                    try:
+                        oid_i = int(oid)
+                    except (TypeError, ValueError):
+                        continue
+                    c.execute(
+                        "UPDATE memory SET reinforcement = MAX(-2.0, reinforcement - 0.5) "
+                        "WHERE id = ?", (oid_i,),
+                    )
+                c.commit()
+        except Exception as exc:
+            logger.debug("dissonance: reinforcement demote failed (%s)", exc)
+
+        # 阶段 5: supersede 接线 (temporal_graph 从"死代码"进主链路)
+        try:
+            from v5.extensions.temporal_graph import resolve_dissonance_supersede
+            resolve_dissonance_supersede(new_content, conflicts)
+        except Exception as exc:
+            logger.debug("dissonance: temporal supersede skipped (%s)", exc)
+
         logger.info("dissonance: recorded %d conflicts", len(conflicts))
     except Exception as exc:
         logger.debug("dissonance: v4 store failed (%s)", exc)

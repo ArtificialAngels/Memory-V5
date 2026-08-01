@@ -9,8 +9,8 @@ from pathlib import Path
 
 logger = logging.getLogger("ikaros.v5.emotional_memory")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(V5_ROOT.parent))
 
 # PAD 变化阈值 (低于此值不记录)
 _DELTA_THRESHOLD = 0.12  # |ΔP|+|ΔA|+|ΔD| 总和阈值
@@ -160,8 +160,8 @@ import json as _json
 from pathlib import Path as _Path
 from typing import Optional
 
-_EMOTION_STATE_PATH = _Path(__file__).resolve().parent.parent / "data" / "v5" / "emotion_state.json"
-_LABEL_STATE_PATH = _Path(__file__).resolve().parent.parent / "data" / "v5" / "emotion_labels.json"
+_EMOTION_STATE_PATH = _Path(__file__).resolve().parent / "data" / "v5" / "emotion_state.json"
+_LABEL_STATE_PATH = _Path(__file__).resolve().parent / "data" / "v5" / "emotion_labels.json"
 
 # 模块级 5s 去重 (spec 4.1: 每个模块维护 _last_injected 时间戳)
 _LAST_DIFF_INJECT = 0.0

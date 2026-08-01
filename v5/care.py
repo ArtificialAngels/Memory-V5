@@ -12,7 +12,7 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.v5.care")
 
-V5_ROOT = Path(__file__).resolve().parent.parent
+V5_ROOT = Path(__file__).resolve().parent
 _CARE_PATH = V5_ROOT / "data" / "v5" / "care.json"
 
 # 阈值
@@ -166,7 +166,7 @@ def _llm_care(care_type: str, coding_sec: float, gaming_sec: float,
               focused_sec: float, is_late_night: bool) -> str:
     """用 LLM 生成自然关怀语句."""
     import sys
-    sys.path.insert(0, str(V5_ROOT))
+    sys.path.insert(0, str(V5_ROOT.parent))
 
     coding_min = int(coding_sec / 60)
     gaming_min = int(gaming_sec / 60)
