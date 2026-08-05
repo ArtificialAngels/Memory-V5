@@ -15,7 +15,7 @@ from typing import Iterator
 logger = logging.getLogger("ikaros.memory.v5.store")
 
 # Inline docs: docs/scripts/core/v5/v5/store.md
-MEM_ROOT = Path(__file__).resolve().parent.parent
+MEM_ROOT = Path(__file__).resolve().parent
 V5_DATA_DIR = MEM_ROOT / "data" / "v5"
 V5_DB_PATH = V5_DATA_DIR / "v5.db"
 
@@ -290,12 +290,29 @@ def conn() -> Iterator[sqlite3.Connection]:
             pass
     # V5.2: create indexes for new columns (only if columns exist)
     try:
-        with c.execute("PRAGMA table_info(memory)") as _info:
-            _existing_cols = {r[1] for r in _info.fetchall()}
+        _info = c.execute("PRAGMA table_info(memory)")
+        _existing_cols = {r[1] for r in _info.fetchall()}
+        _info.close()
         if "character" in _existing_cols:
             c.execute("CREATE INDEX IF NOT EXISTS idx_memory_character ON memory(character)")
         if "evidence_version" in _existing_cols:
             c.execute("CREATE INDEX IF NOT EXISTS idx_memory_evidence ON memory(evidence_version)")
+    except Exception:
+        pass
+    # V5.3 (2026-08-02): archived 列 — 归档而非删除的转存机制.
+    # cleanup 不再物理删除低权重/过期记忆, 而是标记 archived=1 保留在库内
+    # (崩溃/误删可恢复; 检索默认排除, 可通过 v5_memory_get 或带参查询取回).
+    # 注意: 不能用 `with c.execute(...) as cur` — portable-python 3.13 的
+    # sqlite3.Cursor 不支持上下文管理器协议, 会 TypeError 被静默吞掉。
+    try:
+        _info = c.execute("PRAGMA table_info(memory)")
+        _existing_cols = {r[1] for r in _info.fetchall()}
+        _info.close()
+        if "archived" not in _existing_cols:
+            c.execute("ALTER TABLE memory ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+            c.execute("ALTER TABLE memory ADD COLUMN archived_at REAL NOT NULL DEFAULT 0")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_memory_archived ON memory(archived)")
+            logger.info("V5 store: added archived/archived_at columns (转存机制)")
     except Exception:
         pass
     c.commit()
@@ -592,7 +609,7 @@ def search(query: str, top_k: int = 5, min_weight: float = 0.0,
                 "SELECT m.* FROM memory m "
                 "JOIN memory_fts f ON m.id = f.rowid "
                 "WHERE memory_fts MATCH ? "
-                "  AND m.weight >= ? AND m.character = ? "
+                "  AND m.weight >= ? AND m.character = ? AND m.archived = 0 "
                 "ORDER BY bm25(memory_fts) "
                 "LIMIT ?",
                 (fts_query, min_weight, character, top_k),
@@ -602,7 +619,7 @@ def search(query: str, top_k: int = 5, min_weight: float = 0.0,
                 "SELECT m.* FROM memory m "
                 "JOIN memory_fts f ON m.id = f.rowid "
                 "WHERE memory_fts MATCH ? "
-                "  AND m.weight >= ? "
+                "  AND m.weight >= ? AND m.archived = 0 "
                 "ORDER BY bm25(memory_fts) "
                 "LIMIT ?",
                 (fts_query, min_weight, top_k),

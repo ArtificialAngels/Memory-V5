@@ -12,7 +12,7 @@ from typing import Optional
 
 logger = logging.getLogger("ikaros.memory.v5.distill")
 
-V4_ROOT = Path(__file__).resolve().parent.parent
+V4_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(V4_ROOT.parent))
 
 # V3 间隔对齐 (V3 memory_reflect.py:69): 24h between distill

@@ -2,11 +2,16 @@
 
 **Ikaros V5 长期记忆架构 —— 独立记忆插件。**
 
- V5 的记忆引擎是从** Ikaros 主工程**的抽离成独立模组
+V5 的记忆引擎是从 **Ikaros 主工程** 抽离出的独立模组。
 
 通过 **MCP 服务器 + Agent Provider 插件** 两种方式接入长期记忆。
 
-优先适配Hermes Agent
+优先适配 Hermes Agent
+
+> **与上游的关系**：本仓库是 Ikaros 主工程 `core/memory_v5` 的**公开发行子集**——含核心记忆引擎
+> （情感/实体图谱/矛盾消解/检索/对话树等），不含 Ikaros 内部集成件（`action_log` / `goal_contract` /
+> `hermes_provider` / `rules_retriever` / `extensions` / `cogno_5d` 等）。内容随主仓更新定期同步
+> （包名统一为 `v5`，主仓为 `memory_v5`）。
 
 - 对外唯一接口：`v5/mcp_server.py`（FastMCP，40 个 `v5_*` 工具）
 - 生命周期闭环：`hermes-plugin/ikaros_v5/`（Hermes `MemoryProvider`）
@@ -35,6 +40,15 @@ V5 不是简单的"把对话塞进向量库"，而是一套**受控、可解释�
    用户完全拥有，不依赖任何第三方服务。
 8. **即插即用 MCP 接口** — 全部能力通过标准 MCP 暴露，任何兼容 MCP 的 Agent 都能直接调用，
    零改造接入。
+9. **统一检索路由（unified_retrieve）** — `memory_retrieval.py` 提供多路检索路由
+   `scope=auto|semantic|lexical|graph|tree|temporal`：语义不足时自动补图扩散；排序带
+   频率/反馈/新鲜度加权，长程记忆有跨会话提升。一个入口覆盖全部召回策略。
+10. **时序图谱矛盾消解（temporal supersede）** — 新事实与旧记忆冲突时，旧事实按时间线
+    `valid_to` 失效、权重降级（`dissonance` 阶段 5 接线）。记忆库随对话演化，不堆积矛盾。
+11. **对话树（conversation_tree）** — 树形对话结构（fork / merge / conclude / abandon），
+    主线/分支脉络可检索，长对话有组织地生长而非线性堆积。
+12. **后台记忆提升流水线** — `reflect/registry.py` 的 `memory_promote`（6h 两档桥接）与
+    `temporal_extract`（24h 时间戳抽取），让短期对话自然沉淀为长期事实。
 
 ---
 
@@ -47,10 +61,11 @@ v5-memory/
 │   ├── cli.py              # 控制台入口 ikaros-mem-v5
 │   ├── store.py            # SQLite FTS5 存储
 │   ├── search.py           # 三路融合检索 + 向量索引
-│   ├── memory_retrieval.py # 对外检索 API
+│   ├── memory_retrieval.py # 统一检索路由（auto/semantic/lexical/graph/tree/temporal）
 │   ├── validation.py       # 结构化内容守卫
+│   ├── conversation_tree.py # 树形对话结构（fork/merge/conclude/abandon）
 │   ├── affect.py / self_model.py / profile.py / relationship.py ...
-│   ├── reflect/            # 后台整合流水线（consolidate/distill/reflect）
+│   ├── reflect/            # 后台整合流水线（consolidate/distill + memory_promote/temporal_extract）
 │   ├── tools/              # MCP 工具实现
 │   └── llama_launcher.py   # standalone 本地 LLM 热载入（替代 Ikaros 看门狗）
 ├── models/                 # 模型目录（.gguf 不入库）

@@ -20,7 +20,7 @@ if str(V5_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(V5_ROOT.parent))
 
 # IKAROS_ROOT (set by Ikaros-environment or inferred from directory structure)
-# orchestrator.py is at core/memory_v5/v5/orchestrator.py → V5_ROOT = core/memory_v5/
+# orchestrator.py is at core/v5/v5/orchestrator.py → V5_ROOT = core/v5/
 # Ikaros project root = V5_ROOT.parent.parent (after 2026-07-24 normalization)
 IKAROS_ROOT = Path(os.environ.get("IKAROS_ROOT", str(V5_ROOT.parent.parent)))
 _BIN_DIR = IKAROS_ROOT / "bin"

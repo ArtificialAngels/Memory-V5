@@ -14,9 +14,9 @@ from pathlib import Path
 logger = logging.getLogger("ikaros.v5.tools")
 
 # Ikaros-memory/  (tools/ -> v5/ -> Ikaros-memory/)
-V5_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(V5_ROOT) not in sys.path:
-    sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+if str(V5_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(V5_ROOT.parent))
 
 # Shared data dir for the v5 tool layer (latest_thought.json, subconscious.json, ...).
 # Centralized here so self_tool / __init__ / other submodules import one canonical path.

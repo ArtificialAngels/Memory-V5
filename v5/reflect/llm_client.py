@@ -18,18 +18,22 @@ logger = logging.getLogger("ikaros.memory.v5.llm")
 
 # ─── 路径配置 (与 v4 其他模块一致) ──────────────────────────────
 
-V4_ROOT = Path(__file__).resolve().parent.parent
+V4_ROOT = Path(__file__).resolve().parent
 V5_DATA_DIR = V4_ROOT / "data" / "v5"
 
-# dotenv：加载 Hermes Agent 的 .env (若设置了 HERMES_HOME) 与仓库本地 .env
+# 在路径定义完之后做 dotenv 加载 (按 HERMES_HOME → Ikaros 默认 → V4 顺序)
 try:
     from dotenv import load_dotenv
-    _hermes_home = os.environ.get("HERMES_HOME")
-    if _hermes_home:
-        _hh_env = Path(_hermes_home) / ".env"
-        if _hh_env.exists():
-            load_dotenv(_hh_env, override=False)
-    # 仓库本地 .env 允许覆盖 (override=True, 优先级最高)
+    _ikaros_root = os.environ.get("IKAROS_ROOT", r"E:\Ikaros")
+    _hermes_home_default = Path(_ikaros_root) / "data" / "hermes-agent"
+    _env_candidates = [
+        Path(os.environ.get("HERMES_HOME", _hermes_home_default)) / ".env",
+        _hermes_home_default / ".env",
+    ]
+    for _env in _env_candidates:
+        if _env.exists():
+            load_dotenv(_env, override=False)
+    # V4 自己的 .env 允许覆盖 (override=True, 优先级最高)
     _v4_env = V4_ROOT / ".env"
     if _v4_env.exists():
         load_dotenv(_v4_env, override=True)
@@ -156,7 +160,7 @@ def call_llm_auto(
             "Set via:\n"
             "  setx DEEPSEEK_API_KEY \"sk-...\"   (Windows)\n"
             "  export DEEPSEEK_API_KEY=\"sk-...\" (Linux/macOS/git-bash)\n"
-            "Or set it in this repo's .env (DEEPSEEK_API_KEY=sk-...) or HERMES_HOME/.env"
+            "Or add to E:\\Ikaros\\data\\hermes-agent\\.env"
         )
     return call_llm(system, user, provider="deepseek", max_tokens=max_tokens,
                     temperature=temperature, timeout=timeout)
@@ -180,7 +184,7 @@ def _call_deepseek(system: str, user: str, max_tokens: int,
             "DEEPSEEK_API_KEY not set. Set via:\n"
             "  setx DEEPSEEK_API_KEY \"sk-...\"   (Windows)\n"
             "  export DEEPSEEK_API_KEY=\"sk-...\" (Linux/macOS/git-bash)\n"
-            "Or set it in this repo's .env (DEEPSEEK_API_KEY=sk-...) or HERMES_HOME/.env"
+            "Or add to E:\\Ikaros\\data\\hermes-agent\\.env"
         )
 
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/v1/chat/completions"
@@ -243,12 +247,17 @@ def _ensure_local_llm_loaded() -> None:
     复用看门狗模块的 ensure_local_llm() (detached spawn + 等 /health)。
     看门狗只做端口巡检, 不调用本函数; 热载入由 agent 调用本地 LLM 触发。
     """
-    # standalone：用仓库内置的 llama 启动器 (不依赖 Ikaros 看门狗 wd_import)
-    from v5.llama_launcher import ensure_local_llm
+    # 看门狗文件名含连字符, 用 wd_import 按路径加载 (不直接 import)
+    import sys as _sys
+    from pathlib import Path as _P
+    _bin = _P(os.environ.get("IKAROS_ROOT", r"E:\Ikaros")) / "bin"
+    if str(_bin) not in _sys.path:
+        _sys.path.insert(0, str(_bin))
+    from wd_import import ensure_local_llm
     if not ensure_local_llm(timeout=LOCAL_LLM_TIMEOUT):
         raise RuntimeError(
-            "本地 LLM (:8080) 热载入失败。检查模型文件 (models/*.gguf) 或 "
-            "IKAROS_LLAMA_SERVER 是否可用；可先 `python models/download_models.py` 下载模型。"
+            "本地 LLM (:8080) 热载入失败。检查模型文件 / llama-server 是否可用, "
+            "或手动 `llama-help --hotload` 触发热载入。"
         )
 
 

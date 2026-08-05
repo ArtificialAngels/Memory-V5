@@ -78,9 +78,13 @@ class ToolCall:
     success: bool = True
     duration_ms: float = 0.0
     timestamp: float = 0.0
+    # S3: 工具调用 id (OpenAI toolCallId) —— 持久化需要, 否则有工具的 chat
+    # 落库时 ToolCall(**tc) 因多余关键字抛 TypeError 被吞, 节点内容静默丢失.
+    id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "id": self.id,
             "name": self.name,
             "params": self.params,
             "result_summary": self.result_summary,
@@ -92,6 +96,7 @@ class ToolCall:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ToolCall":
         return cls(
+            id=d.get("id", ""),
             name=d.get("name", ""),
             params=d.get("params", {}) or {},
             result_summary=d.get("result_summary", ""),
@@ -328,6 +333,14 @@ class ConversationTree:
         self.nodes: Dict[str, ConvNode] = {}
         self.root_id: Optional[str] = None
         self.current_id: Optional[str] = None
+        # S1 (结构性修复): 显式主线终点 (trunk_id)。
+        #   旧设计靠 node_type + "父节点有无 children" 的时序快照判定主线, 导致:
+        #   - branch 下继续对话被误标 trunk (F1 已修继承)
+        #   - 主线延续受"先 fork 后继续"影响, 主线身份随创建顺序漂移
+        #   - 无法显式把分支提升为主线
+        #   现在 trunk_id 是唯一真源: add_turn 在 trunk_id 节点下 → 主线延续;
+        #   其余 → branch。is_valid_branch/__trunk__ 合并查找直接沿 trunk_id。
+        self.trunk_id: Optional[str] = None
         self.version: int = 0
         self.persist_key = persist_key
         self.data_dir = Path(data_dir) if data_dir else V5_DATA_DIR
@@ -414,7 +427,8 @@ class ConversationTree:
             if seed_messages:
                 content = json.dumps(seed_messages, ensure_ascii=False)
                 sm = seed_summary or _extract_summary(seed_messages)
-                mid = self._store_fn(content, type="conversation", tags=_tree_tag(root_id))
+                mid = self._store_fn(content, type="conversation",
+                                     tags=f"{_tree_tag(root_id)} session:{self.persist_key}")
             else:
                 sm = seed_summary
             root = ConvNode(
@@ -428,6 +442,8 @@ class ConversationTree:
             self.nodes[root.id] = root
             self.root_id = root.id
             self.current_id = root.id
+            # S1: 根不是主线; 主线从根的第一个子节点开始 (add_turn 时设置)
+            self.trunk_id = None
             self.version += 1
         self._emit()
         self.persist()
@@ -545,6 +561,8 @@ class ConversationTree:
                 if sibs:
                     entries = []
                     for s in sibs:
+                        if not s.is_valid:
+                            continue  # F3: 废弃分支不注入兄弟上下文
                         label = s.branch_label or "branch"
                         summary = s.summary[:60] if s.summary else ""
                         conclusions = "; ".join(c.text[:40] for c in s.conclusions[:2])
@@ -565,7 +583,7 @@ class ConversationTree:
             for a in ancestors:
                 for bf in a.merged_from:
                     branch = self.nodes.get(bf)
-                    if branch:
+                    if branch and branch.is_valid:  # F3: 废弃分支的结论不注入
                         for c in branch.conclusions:
                             insights.append(
                                 f"[merged:{branch.branch_label}] {c.text}"
@@ -601,6 +619,7 @@ class ConversationTree:
         tool_calls: Optional[List["ToolCall"]] = None,
         usage: Optional[Dict[str, Any]] = None,
         skills_used: Optional[List[str]] = None,
+        force_branch: bool = False,
     ) -> ConvNode:
         with self._lock:
             pid = parent_id or self.current_id
@@ -608,12 +627,31 @@ class ConversationTree:
             if not parent:
                 raise ValueError(f"parent not found: {pid}")
 
-            # 存储对话内容到 V5 store (带 node/branch 树域标签, 供 tree_scoped_retrieve)
+            # 存储对话内容到 V5 store (带 node/branch/session 树域标签, 供 tree_scoped_retrieve
+            # 做会话隔离过滤 —— session:<persist_key> 保证多会话记忆不串台, H1 修复)
             content = json.dumps(messages, ensure_ascii=False)
             sm = _extract_summary(messages)
             node_id = uid("n")
-            new_tags = f"{tags} {_tree_tag(node_id, branch_label)}".strip()
+            new_tags = f"{tags} {_tree_tag(node_id, branch_label)} session:{self.persist_key}".strip()
             mid = self._store_fn(content, type="conversation", tags=new_tags)
+            if mid == 0:
+                # F5: store 失败 (返回 0) 时显式告警, 不再无声丢内容 (节点仍创建, UI 可见)
+                logger.warning("add_turn: V5 store failed for node %s (content not persisted)", node_id)
+
+            # S1: node_type 由 trunk_id 唯一决定 (不再依赖时序快照):
+            #   - force_branch=True (显式分叉: branch_from/前端 fork) → branch
+            #   - parent 是当前主线终点 (trunk_id) → trunk (主线延续)
+            #   - 树还没有主线 (trunk_id=None) 且 parent 是根 → trunk (主线起点)
+            #   - 其余 (分支内继续/主线中间节点分叉/其他类型节点下) → branch
+            if force_branch:
+                node_type = "branch"
+            elif self.trunk_id is None and parent.id == self.root_id:
+                node_type = "trunk"
+            elif parent.id == self.trunk_id and parent.node_type == "trunk":
+                # S1: 主线延续 (conclusion 节点虽曾是 trunk_id, 但收尾后不再延续主线)
+                node_type = "trunk"
+            else:
+                node_type = "branch"
 
             node = ConvNode(
                 id=node_id,
@@ -621,6 +659,8 @@ class ConversationTree:
                 agent=parent.agent,
                 depth=parent.depth + 1,
                 branch_label=branch_label,
+                # S1: node_type 已由上方 trunk_id 判定逻辑决定 (F1 继承语义并入 trunk_id)
+                node_type=node_type,
                 v5_memory_id=mid,
                 summary=sm,
                 state=_clone(state) if state is not None else _clone(parent.state),
@@ -635,6 +675,9 @@ class ConversationTree:
             self.nodes[node.id] = node
             parent.children.append(node.id)
             self.current_id = node.id
+            # S1: 主线延续时 trunk_id 前进到新节点 (主线终点 = 最近的主线对话)
+            if node_type == "trunk":
+                self.trunk_id = node.id
             self.version += 1
         self._emit()
         self.persist()
@@ -648,10 +691,15 @@ class ConversationTree:
         branch_label: Optional[str] = None,
         **kwargs: Any,
     ) -> ConvNode:
-        """在该节点下创建子节点 (与已有子节点成兄弟)."""
+        """在该节点下创建子节点 (与已有子节点成兄弟).
+
+        S1: 显式分叉语义 —— 无论目标节点是不是 trunk_id, 都强制 node_type="branch"
+        (不再依赖"父节点是否已有子节点"的时序判定)。
+        """
         node = self.nodes.get(node_id)
         if not node:
             raise ValueError(f"node not found: {node_id}")
+        kwargs.setdefault("force_branch", True)
         return self.add_turn(
             messages,
             parent_id=node.id,
@@ -706,6 +754,11 @@ class ConversationTree:
         config: Optional[Dict[str, Any]] = None,
         title: Optional[str] = None,
         tags: str = "",
+        # F4: 与 add_turn 对齐的元数据参数 (fork 节点也应能携带思考/工具/用量)
+        thinking: str = "",
+        tool_calls: Optional[List["ToolCall"]] = None,
+        usage: Optional[Dict[str, Any]] = None,
+        skills_used: Optional[List[str]] = None,
     ) -> ConvNode:
         """从任意节点分叉出新分支。
 
@@ -719,8 +772,11 @@ class ConversationTree:
         content = json.dumps(messages, ensure_ascii=False)
         sm = _extract_summary(messages)
         node_id = uid("br")
-        new_tags = f"{tags} {_tree_tag(node_id, branch_label)}".strip()
+        new_tags = f"{tags} {_tree_tag(node_id, branch_label)} session:{self.persist_key}".strip()
         mid = self._store_fn(content, type="conversation", tags=new_tags)
+        if mid == 0:
+            # F5: store 失败 (返回 0) 时显式告警, 不再无声丢内容
+            logger.warning("fork_branch: V5 store failed for node %s (content not persisted)", node_id)
 
         node = ConvNode(
             id=node_id,
@@ -734,6 +790,10 @@ class ConversationTree:
             state=_clone(state) if state is not None else _clone(fork_node.state),
             config=_clone(config) if config is not None else _clone(fork_node.config),
             meta={"created_at": time.time(), "title": title},
+            thinking=thinking,
+            tool_calls=list(tool_calls) if tool_calls else [],
+            usage=usage or {},
+            skills_used=list(skills_used) if skills_used else [],
             created_at=time.time(),
         )
         self.nodes[node.id] = node
@@ -755,6 +815,15 @@ class ConversationTree:
         if not node:
             raise ValueError(f"node not found: {node_id}")
         node.node_type = "conclusion"
+        # S1: 主线终点被收尾 → 回退到最近的 trunk 祖先 (conclusion 不再延续主线)
+        if self.trunk_id == node_id:
+            anc = self.nodes.get(node.parent_id) if node.parent_id else None
+            self.trunk_id = None
+            while anc:
+                if anc.node_type == "trunk" and anc.id != self.root_id:
+                    self.trunk_id = anc.id
+                    break
+                anc = self.nodes.get(anc.parent_id) if anc.parent_id else None
         for text in conclusions:
             node.conclusions.append(NodeInsight(
                 text=text,
@@ -856,13 +925,13 @@ class ConversationTree:
     def is_valid_branch(self, node_id: str) -> bool:
         """判定分支是否有效: 路径可达主干 且 未被废弃。
 
+        S1 重写: 主干判定沿 trunk_id (唯一真源), 不再依赖 node_type 时序快照。
         规则:
         1. is_valid=False → 无效（已废弃）
-        2. trunk 类型 → 有效
+        2. 节点在主线路径上 (沿祖先链可达 trunk_id) → 有效
         3. 已合并（有 merge_target）→ 追踪 merge_target 递归判定
-        4. 未合并 → 沿祖先链找是否有 trunk 节点
-        5. 既无 trunk 也无 merge_target → 无效
-        6. 检测到环 → 无效
+        4. 树未初始化主线 (trunk_id=None) 且节点沿祖先链可达根 → 有效 (兼容旧树)
+        5. 检测到环 → 无效
         """
         visited: set[str] = set()
         current_id: Optional[str] = node_id
@@ -877,8 +946,15 @@ class ConversationTree:
             if not node.is_valid:
                 return False
 
-            # trunk 节点 → 主干可达
-            if node.node_type == "trunk":
+            # 主线可达 → 有效:
+            #   - 主线终点 (trunk_id) 本身
+            #   - 任何 trunk 类型节点 (主线链成员; node_type 已由 trunk_id 维护, 可靠)
+            #   - 从主线中间节点 fork 的分支, 其祖先链含 trunk 节点即有效
+            if current_id == self.trunk_id or (node.node_type == "trunk" and node.id != self.root_id):
+                return True
+
+            # 旧树兼容 (trunk_id=None): 节点沿祖先链可达根 → 有效
+            if self.trunk_id is None and current_id == self.root_id:
                 return True
 
             # 已合并 → 追踪 merge_target
@@ -891,11 +967,43 @@ class ConversationTree:
                 current_id = node.parent_id
                 continue
 
-            # 无父节点且非 trunk → 孤立节点
+            # 无父节点且非主线 → 孤立节点
             return False
 
         # 检测到环
         return False
+
+    # ── S1: 显式主线管理 ──
+    def set_trunk(self, node_id: str, cascade: bool = False) -> "ConvNode":
+        """把节点提升为新的主线终点 (trunk_id)。
+
+        用户显式把某个分支节点设为主线: 该节点成为主线终点,
+        后续在其下继续对话 = 主线延续 (trunk)。
+        cascade=True 时把该节点祖先路径上所有节点标记为 trunk (重建主线链)。
+        """
+        with self._lock:
+            node = self.nodes.get(node_id)
+            if not node:
+                raise ValueError(f"node not found: {node_id}")
+            # F14: 废弃分支禁止提升为主线 (语义上废弃=已放弃, 不应成为主线锚点)
+            if not node.is_valid:
+                raise ValueError(f"cannot set trunk: node {node_id} is abandoned (is_valid=False)")
+            self.trunk_id = node.id
+            # 节点自身必为 trunk (主线终点), 否则 add_turn 的
+            # parent.node_type == "trunk" 判定会拒绝主线延续
+            if node.id != self.root_id:
+                node.node_type = "trunk"
+            if cascade:
+                # 沿祖先链 (不含自身, 已标) 全部标 trunk, 重建主线链
+                cur = self.nodes.get(node.parent_id) if node.parent_id else None
+                while cur:
+                    if cur.id != self.root_id:
+                        cur.node_type = "trunk"
+                    cur = self.nodes.get(cur.parent_id) if cur.parent_id else None
+            self.version += 1
+        self._emit()
+        self.persist()
+        return node
 
     # ── 深度重算 (delete_node 重挂子树后用) ──
     def _recompute_depth(self, node_id: str, depth: int) -> None:
@@ -909,6 +1017,9 @@ class ConversationTree:
 
     # ── 剪枝 ──
     def prune(self, node_id: str) -> None:
+        if node_id == self.root_id:
+            # 禁止剪根: 会删光整棵树且 current_id 指向已删 root, 使树彻底失效.
+            raise ValueError("prune(root) is not allowed; the root node cannot be pruned")
         with self._lock:
             del_ids = {n.id for n in self.subtree(node_id)}
             target = self.nodes.get(node_id)
@@ -918,6 +1029,18 @@ class ConversationTree:
                     p.children = [c for c in p.children if c != node_id]
             for nid in del_ids:
                 self.nodes.pop(nid, None)
+            # F2: 清理其它节点对已删节点的 merge 引用 (merged_from/merge_target/
+            # merged_insights/conclusions.source_ids), 避免 unmerge 静默失效 + 数据残留
+            self._cleanup_merge_refs(del_ids)
+            # S1: 主线终点被删 → 重指最近的 trunk 祖先 (或根), 保持主线语义
+            if self.trunk_id in del_ids:
+                self.trunk_id = None
+                anc = self.nodes.get(target.parent_id) if target else None
+                while anc:
+                    if anc.id != self.root_id:
+                        self.trunk_id = anc.id
+                        break
+                    anc = self.nodes.get(anc.parent_id) if anc.parent_id else None
         if self.current_id in del_ids:
             anc = self.nodes.get(target.parent_id) if target else None
             while anc and anc.id in del_ids:
@@ -926,6 +1049,32 @@ class ConversationTree:
         self.version += 1
         self._emit()
         self.persist()
+
+    def _cleanup_merge_refs(self, deleted_ids: "set[str]") -> None:
+        """删除节点后清理 DAG merge 引用 (需已持有 _lock)。
+
+        - trunk.merged_from 移除已删 branch id
+        - 其他节点的 merge_target 指向已删节点 → 置 None
+        - trunk.state.merged_insights 移除对应条目
+        - trunk.conclusions 移除 source_ids 含已删节点的注入结论 (仅限注入的)
+        """
+        if not deleted_ids:
+            return
+        for other in self.nodes.values():
+            if deleted_ids & set(other.merged_from):
+                other.merged_from = [b for b in other.merged_from if b not in deleted_ids]
+            if other.merge_target in deleted_ids:
+                other.merge_target = None
+            insights = other.state.get("merged_insights")
+            if isinstance(insights, list):
+                other.state["merged_insights"] = [
+                    m for m in insights if m.get("branch_id") not in deleted_ids
+                ]
+            # 只清"注入的"结论: source_ids 含已删节点且 text 带 [merged from 标记
+            other.conclusions = [
+                c for c in other.conclusions
+                if not (deleted_ids & set(c.source_ids) and c.text.startswith("[merged from"))
+            ]
 
     # ── v2.2: 设置节点代理归属 (ekko-agent 模式) ──
     def set_agent(self, node_id: str, agent: str, cascade: bool = False) -> "ConvNode":
@@ -1010,6 +1159,11 @@ class ConversationTree:
                         self._recompute_depth(child_id, parent.depth + 1)
             # 删除本节点
             self.nodes.pop(node_id, None)
+            # F2: 清理其它节点对已删节点的 merge 引用
+            self._cleanup_merge_refs({node_id})
+            # S1: 主线终点被删 → 重指父节点 (保持主线语义)
+            if self.trunk_id == node_id:
+                self.trunk_id = parent.id if parent and parent.id != self.root_id else None
             # current 指向被删节点 → 重指父节点 (或 root)
             if self.current_id == node_id:
                 self.current_id = parent.id if parent else self.root_id
@@ -1083,6 +1237,8 @@ class ConversationTree:
                 "schema": "super-conv-2.0",
                 "root_id": self.root_id,
                 "current_id": self.current_id,
+                # S1: 持久化主线终点, 重启后主线语义不丢
+                "trunk_id": self.trunk_id,
                 "nodes": [n.to_dict() for n in self.nodes.values()],
             }
         return json.dumps(payload, ensure_ascii=False)
@@ -1104,6 +1260,9 @@ class ConversationTree:
         t.version = data.get("v", 0)
         t.root_id = data.get("root_id")
         t.current_id = data.get("current_id")
+        # S1: 读取主线终点; 旧 JSON (无 trunk_id) 时按最深的 trunk 节点推断:
+        #   优先取"从根出发的最深 trunk 链末端" (旧树主线 ≈ 首条链)。
+        t.trunk_id = data.get("trunk_id")
         t.nodes = {n["id"]: ConvNode.from_dict(n) for n in data.get("nodes", [])}
 
         # v1 → v2 自动迁移: 没有 schema 字段 → 所有节点 node_type 推断
@@ -1119,6 +1278,28 @@ class ConversationTree:
                 migrated += 1
             if migrated:
                 logger.info("v1→v2 migration: %d nodes", migrated)
+
+        # S1 兼容: trunk_id 缺失时按 node_type 推断主线终点 —— 找最深的 trunk 链末端
+        # (优先从根的首条子链向下: 根 → 第一个 trunk 子 → 其第一个 trunk 子 …)
+        if t.trunk_id is None and t.root_id is not None:
+            root = t.nodes.get(t.root_id)
+            if root:
+                cur = root
+                # 根的首个 trunk 子节点
+                nxt = next((c for c in cur.children
+                            if t.nodes.get(c) and t.nodes[c].node_type == "trunk"), None)
+                if nxt is None:
+                    nxt = next((c for c in cur.children if c in t.nodes), None)
+                cur = t.nodes.get(nxt) if nxt else None
+                while cur:
+                    # 沿"首个子节点"链下探 (旧树主线 = 最左路径)
+                    child = next((c for c in cur.children
+                                  if t.nodes.get(c) and t.nodes[c].node_type == "trunk"), None)
+                    if child is None:
+                        break
+                    cur = t.nodes.get(child)
+                if cur is not None:
+                    t.trunk_id = cur.id
         return t
 
     @classmethod
@@ -1275,8 +1456,9 @@ class MemoryRetriever:
         node = self.tree.get_node(node_id) if node_id else None
         branch_label = node.branch_label if node else None
         base_tags = " ".join(mem.get("tags", [])) if isinstance(mem.get("tags"), list) else mem.get("tags", "")
-        # 带 node/branch 树域标签, 供 tree_scoped_retrieve 做树域过滤 (fact 同样适用)
-        new_tags = f"{base_tags} {_tree_tag(node_id, branch_label)}".strip() if (node_id or base_tags) else base_tags
+        # 带 node/branch/session 树域标签, 供 tree_scoped_retrieve 做树域+会话过滤 (fact 同样适用)
+        sess_tag = f" session:{self.tree.persist_key}" if hasattr(self.tree, "persist_key") else ""
+        new_tags = f"{base_tags} {_tree_tag(node_id, branch_label)}{sess_tag}".strip() if (node_id or base_tags) else base_tags
         try:
             mid = self.tree._store_fn(text, type="fact", tags=new_tags)
         except Exception as e:

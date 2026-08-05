@@ -22,6 +22,62 @@ _EMBED_CACHE_MAX = 512
 _VI_LOCK = threading.Lock()
 _VI: dict = {"instance": None, "dir": None, "ts": 0.0}
 
+# ── 跨进程 Chroma 写锁 (2026-08-02 根因修复) ────────────────────────────
+# 多进程 (MCP server × N + watchdog + reflect loop) 并发写同一 Chroma 持久目录
+# 会触发 hnsw compactor 冲突 ("Failed to apply logs to the hnsw segment writer")。
+# 写前拿文件锁串行化。进程内线程锁 + 进程间文件锁双保险。
+_CHROMA_LOCK_FILE = Path(__file__).resolve().parent / "data" / "v5" / ".chroma-write.lock"
+_chroma_thread_lock = threading.Lock()
+
+
+class _chroma_write_lock:
+    """上下文管理器: 拿跨进程文件锁 (Windows msvcrt / POSIX fcntl)."""
+
+    def __init__(self, timeout: float = 10.0):
+        self._timeout = timeout
+        self._fd = None
+
+    def __enter__(self):
+        _chroma_thread_lock.acquire()
+        _CHROMA_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = open(str(_CHROMA_LOCK_FILE), "a+b")
+        deadline = time.time() + self._timeout
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                try:
+                    msvcrt.locking(self._fd.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.time() > deadline:
+                        self._fd.close()
+                        self._fd = None
+                        _chroma_thread_lock.release()
+                        raise TimeoutError("chroma write lock timeout")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self._fd is not None:
+                if os.name == "nt":
+                    import msvcrt
+                    try:
+                        self._fd.seek(0)
+                        msvcrt.locking(self._fd.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+                self._fd.close()
+        finally:
+            _chroma_thread_lock.release()
+        return False
+
 
 def _cache_cfg() -> dict:
     try:
@@ -37,7 +93,7 @@ def _cache_enabled() -> bool:
     except Exception:
         return True
 
-MEM_ROOT = Path(__file__).resolve().parent.parent
+MEM_ROOT = Path(__file__).resolve().parent
 V5_DATA_DIR = MEM_ROOT / "data" / "v5"
 CHROMA_DIR = V5_DATA_DIR / "chroma"
 
@@ -186,17 +242,23 @@ class VectorIndex:
 
     def add(self, memory_id: int, content: str, *,
             type: str = "fact", tags: str = "", weight: float = 0.6) -> bool:
-        """Add or update a memory vector."""
+        """Add or update a memory vector.
+
+        跨进程写锁: 多进程 (MCP server × N + watchdog + reflect loop) 并发写同一
+        Chroma 实例会触发 hnsw compactor 冲突 ("Failed to apply logs to the hnsw
+        segment writer")。写前拿文件锁串行化, 消除该失败源 (2026-08-02 根因修复)。
+        """
         embedding = _get_embedding(content, task="document")
         if embedding is None:
             return False
         try:
-            self._collection.upsert(
-                ids=[str(memory_id)],
-                documents=[content],
-                embeddings=[embedding],
-                metadatas=[{"type": type, "tags": tags, "weight": weight}],
-            )
+            with _chroma_write_lock():
+                self._collection.upsert(
+                    ids=[str(memory_id)],
+                    documents=[content],
+                    embeddings=[embedding],
+                    metadatas=[{"type": type, "tags": tags, "weight": weight}],
+                )
             return True
         except Exception as e:
             logger.warning("vector add failed: %s", e)

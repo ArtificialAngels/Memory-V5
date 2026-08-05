@@ -7,8 +7,8 @@ import sys
 # Ensure Ikaros-memory/ is importable (so `import v5` works from anywhere).
 # Reuse the single canonical root path defined in utils (no duplicate computation).
 from v5.tools.utils import V5_ROOT
-if str(V5_ROOT) not in sys.path:
-    sys.path.insert(0, str(V5_ROOT))
+if str(V5_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(V5_ROOT.parent))
 
 from v5.tools import care_tool
 from v5.tools import emotion_tool

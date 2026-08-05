@@ -93,7 +93,7 @@ def v5_activity_status() -> str:
     """
     import sys as _sys
     from pathlib import Path as _Path
-    _root = str(_Path(__file__).resolve().parent.parent.parent)
+    _root = str(_Path(__file__).resolve().parent)
     if _root not in _sys.path:
         _sys.path.insert(0, _root)
     import cogno_5d
@@ -115,7 +115,7 @@ def v5_context_compression_stats() -> str:
     """
     import sys as _sys
     from pathlib import Path as _Path
-    _root = str(_Path(__file__).resolve().parent.parent.parent)
+    _root = str(_Path(__file__).resolve().parent)
     if _root not in _sys.path:
         _sys.path.insert(0, _root)
 

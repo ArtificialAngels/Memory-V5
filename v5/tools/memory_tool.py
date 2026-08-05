@@ -56,16 +56,10 @@ def v5_memory_store(
         pad_d=float(pad_d),
     )
 
-    dissonance = None
-    try:
-        from v5.dissonance import detect_dissonance
-        dr = detect_dissonance(content, type)
-        if dr and dr.get("conflicts"):
-            dissonance = dr
-    except Exception:  # noqa: BLE001
-        pass
-
-    return answer(f"记忆已存储 #{mid}", {"id": mid, "ok": True, "dissonance": dissonance})
+    # 认知失调检测由 store.store() 内部异步执行（store.py _run_dissonance_detection），
+    # 这里不再同步调 detect_dissonance——它会对候选逐条调云端 NLI（最多 3×20s），
+    # 曾导致 MCP store 调用 300s 超时。保留 dissonance=None 维持返回结构兼容。
+    return answer(f"记忆已存储 #{mid}", {"id": mid, "ok": True, "dissonance": None})
 
 
 @safe_tool
@@ -121,7 +115,7 @@ def v5_memory_get(memory_id: int) -> str:
     m = api.get(int(memory_id))
     if m is None:
         return dumps({"ok": False, "error": "not_found", "id": memory_id})
-        return dumps({"ok": False, "error": "not_found", "id": memory_id})
+    return answer(f"记忆 #{memory_id} 读取成功", m)
 
 
 @safe_tool

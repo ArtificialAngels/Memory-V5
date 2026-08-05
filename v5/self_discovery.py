@@ -12,7 +12,7 @@ from typing import Optional
 logger = logging.getLogger("ikaros.v5.self_discovery")
 
 # 项目根
-IKAROS_ROOT = Path(__file__).resolve().parent.parent.parent  # resolves to Ikaros repo root (core/memory_v5/ -> core/ -> root)
+IKAROS_ROOT = Path(__file__).resolve().parent.parent.parent  # resolves to Ikaros repo root (core/v5/ -> core/ -> root)
 sys.path.insert(0, str(IKAROS_ROOT / "core"))
 HERMES_EXE = IKAROS_ROOT / "core" / "hermes" / "venv" / "Scripts" / "hermes.exe"
 

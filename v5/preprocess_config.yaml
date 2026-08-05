@@ -11,6 +11,12 @@ memory_retrieval:
   time_decay_per_day: 0.05
   min_fused_score: 0.3    # 融合分阈值, 低于此不注入 (2026-07-26 重新标定: nomic-embed-text-v2-moe 的余弦距离下, 真实语义匹配 fused≈0.3~0.5, 噪声≈0.15; 原 0.6 会把所有有效召回过滤掉导致语义召回失效)
   top_k: 5
+  auto_route: true            # unified_retrieve 自动补路: semantic 不足时补图扩散 (阶段1)
+  graph_min_score: 0.2        # 图扩散补路的最低分阈值, 低于此丢弃 (防噪音)
+  frequency_weight: 0.05      # 阶段4: 高频访问记忆加分 = log2(access_count+1)*0.05, cap +0.25
+  reinforcement_weight: 0.10  # 阶段4: 用户强化记忆加分 = reinforcement*0.10, cap +0.15
+  freshness_weight: 0.08      # 阶段4: 最近 7 天访问过 → +0.08
+  long_term_boost: 0.05       # 阶段2: 永久记忆(long_term=1)小幅加分, 防被新记忆挤出
   type_boost:
     emotion: 1.2          # 情感记忆优先
     fact: 1.1
@@ -69,6 +75,7 @@ cache:
   vector_refresh_seconds: 30   # 最多 30s 重开一次, 拾取反思循环等外部新增记忆
   retrieve_ttl_seconds: 20     # 检索结果短 TTL: 同 query 20s 内直接返回, 跳过 embedding+chroma
   retrieve_ttl_enabled: true
+  ontology_align_enabled: true  # 阶段3: 本体对齐 (difflib) 挂进实体候选 (2026-08-01 开启)
 
 # Validation rules (v5.validation module)
 # Each rule can be individually enabled/disabled.

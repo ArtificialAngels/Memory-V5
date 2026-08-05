@@ -26,8 +26,8 @@ import sys
 import traceback
 from pathlib import Path
 
-# MEM_ROOT = core/memory_v5  (parent of this file's directory core/memory_v5/v5)
-MEM_ROOT = Path(__file__).resolve().parent.parent
+# MEM_ROOT = core/v5  (parent of this file's directory core/v5/v5)
+MEM_ROOT = Path(__file__).resolve().parent
 if str(MEM_ROOT) not in sys.path:
     sys.path.insert(0, str(MEM_ROOT))
 
