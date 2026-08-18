@@ -11,8 +11,8 @@ import sys
 import time
 from pathlib import Path
 
-V5_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(V5_ROOT.parent))
 
 from v5.memory_api import V5MemoryAPI
 
@@ -29,9 +29,14 @@ def test_dual_addressing():
         importance=0.8,
     )
     assert mid > 0
-    assert len(api.search(domain="test_dom")) > 0
-    assert len(api.search(key="api_key_1")) > 0
-    assert len(api.search(category_path="self/values")) > 0
+    try:
+        assert len(api.search(domain="test_dom")) > 0
+        assert len(api.search(key="api_key_1")) > 0
+        assert len(api.search(category_path="self/values")) > 0
+    finally:
+        # 2026-08-14: 测试隔离修复 —— 此前本测试写入真实 v5.db 且不清理,
+        # 每次 pytest 运行都给生产记忆库留下 1 条垃圾行 (v5.db id 递增).
+        assert api.delete(mid) is True
 
 
 def test_get_delete_stats():

@@ -1,6 +1,8 @@
-# Unified validation framework for Ikaros V5.
-# Provides input checking, logic verification, error classification,
-# and extensible rule registration.
+"""统一校验框架 (Unified validation framework) for Ikaros V5.
+
+Provides input checking, logic verification, error classification,
+and extensible rule registration.
+"""
 
 from __future__ import annotations
 

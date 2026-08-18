@@ -20,12 +20,15 @@ import v5.search as search_mod
 
 
 @pytest.fixture
-def stub_embed():
-    """隔离真实 :8587 embedding 服务, 用固定向量."""
-    search_mod._get_embedding = lambda text, task="query": [0.1] * 64
+def stub_embed(monkeypatch):
+    """隔离真实 :8587 embedding 服务, 用固定向量.
+
+    用 monkeypatch 保证跑完自动还原 (原实现手动还原是死代码:
+    _get_embedding 无 __wrapped__, 还原时把自己赋给自己,
+    导致后续测试 (如 test_search_cache) 拿到被污染的 stub).
+    """
+    monkeypatch.setattr(search_mod, "_get_embedding", lambda text, task="query": [0.1] * 64)
     yield
-    # 还原 (pytest 每个测试独立进程, 这里只是保险)
-    search_mod._get_embedding = search_mod._get_embedding.__wrapped__ if hasattr(search_mod._get_embedding, "__wrapped__") else search_mod._get_embedding
 
 
 def _fresh_index():

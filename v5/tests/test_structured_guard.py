@@ -6,8 +6,8 @@ Guard 必须拦截: LLM 旁白前缀 / 泄漏 JSON / markdown fence / 超长原�
 import sys
 from pathlib import Path
 
-V5_ROOT = Path(__file__).resolve().parent.parent.parent  # core/v5
-sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent  # core/v5
+sys.path.insert(0, str(V5_ROOT.parent))
 
 from v5.validation import is_clean_structured_content, guard_structured_content  # noqa: E402
 

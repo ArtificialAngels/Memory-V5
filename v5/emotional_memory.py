@@ -91,47 +91,12 @@ def _generate_causal(
     old_pad: tuple[float, float, float],
     new_pad: tuple[float, float, float],
 ) -> str | None:
-    """用云端 LLM (DeepSeek) 推断情感变化的因果."""
-    try:
-        from v5.reflect.llm_client import call_llm_auto
-    except Exception as exc:
-        logger.debug("emotional_memory: LLM unavailable (%s)", exc)
-        return _rule_based_causal(user_text, old_pad, new_pad)
+    """推断情感变化因果 — 2026-08-14 决策 A: 纯规则, 不调云端 LLM.
 
-    # PAD 变化描述
-    op, oa, od = old_pad
-    np, na, nd = new_pad
-
-    def _p_label(v: float, dim: str) -> str:
-        if dim == "p":
-            return "愉悦" if v > 0.1 else ("低落" if v < -0.1 else "平和")
-        if dim == "a":
-            return "兴奋" if v > 0.1 else ("困倦" if v < -0.1 else "平静")
-        return "自信" if v > 0.1 else ("乖巧" if v < -0.1 else "中立")
-
-    old_desc = f"{_p_label(op,'p')}-{_p_label(oa,'a')}-{_p_label(od,'d')}"
-    new_desc = f"{_p_label(np,'p')}-{_p_label(na,'a')}-{_p_label(nd,'d')}"
-
-    context = f"哥哥刚才说: \"{user_text[:200]}\""
-    if prev_text:
-        context += f"\n哥哥上一句话: \"{prev_text[:200]}\""
-    context += f"\n\n情绪从 [{old_desc}] 变成了 [{new_desc}]"
-
-    try:
-        result = call_llm_auto(
-            _CAUSAL_PROMPT,
-            context,
-            max_tokens=128,
-            temperature=0.3,
-            timeout=45,
-        )
-        text = result.content.strip()
-        if len(text) < 4 or len(text) > 300:
-            return None
-        return text
-    except Exception as exc:
-        logger.debug("emotional_memory: LLM call failed (%s)", exc)
-        return _rule_based_causal(user_text, old_pad, new_pad)
+    原实现调 DeepSeek 推断, 输出常泄漏思维链（"根据规则，如果情绪没有变化…"）
+    污染 emotional_event 记忆。现直接走 _rule_based_causal。
+    """
+    return _rule_based_causal(user_text, old_pad, new_pad)
 
 
 def _rule_based_causal(

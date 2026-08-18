@@ -13,8 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
-V5_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(V5_ROOT.parent))
 
 
 class TestVitality:

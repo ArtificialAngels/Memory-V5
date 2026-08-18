@@ -1,7 +1,9 @@
-# Entity Graph Memory System for Ikaros V5
-# Ported from Innerlife-main (MIT License) entity graph architecture.
-# Provides: entity extraction, entity resolution, spreading activation search,
-# episodic memory consolidation, and graph-based memory retrieval.
+"""Entity Graph Memory System for Ikaros V5.
+
+Ported from Innerlife-main (MIT License) entity graph architecture.
+Provides: entity extraction, entity resolution, spreading activation search,
+episodic memory consolidation, and graph-based memory retrieval.
+"""
 
 from __future__ import annotations
 
@@ -68,6 +70,7 @@ CREATE TABLE IF NOT EXISTS eg_edges (
     target_entity_id TEXT NOT NULL,
     weight REAL NOT NULL DEFAULT 0.0,
     co_occurrence_count INTEGER NOT NULL DEFAULT 0,
+    relation_type TEXT NOT NULL DEFAULT 'co_occurrence',
     last_seen_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     PRIMARY KEY(source_entity_id, target_entity_id)
 );
@@ -114,6 +117,11 @@ def eg_conn() -> Iterator[sqlite3.Connection]:
     except Exception:
         pass
     c.executescript(ENTITY_GRAPH_SCHEMA)
+    # V5.7: eg_edges 补 relation_type 列 (幂等; 旧库迁移)
+    try:
+        c.execute("ALTER TABLE eg_edges ADD COLUMN relation_type TEXT NOT NULL DEFAULT 'co_occurrence'")
+    except Exception:
+        pass
     c.commit()
     try:
         yield c
@@ -276,7 +284,8 @@ def add_entity_alias(entity_id: str, alias: str, confidence: float = 1.0,
         )
 
 
-def upsert_entity_edge(source_id: str, target_id: str, delta: float) -> None:
+def upsert_entity_edge(source_id: str, target_id: str, delta: float,
+                       relation_type: str = "co_occurrence") -> None:
     now = int(time.time())
     with eg_conn() as c:
         existing = c.execute(
@@ -292,9 +301,10 @@ def upsert_entity_edge(source_id: str, target_id: str, delta: float) -> None:
             )
         else:
             c.execute(
-                "INSERT INTO eg_edges (source_entity_id, target_entity_id, weight, co_occurrence_count, last_seen_at) "
-                "VALUES (?, ?, ?, 1, ?)",
-                (source_id, target_id, min(1.0, delta), now)
+                "INSERT INTO eg_edges (source_entity_id, target_entity_id, weight, "
+                "co_occurrence_count, relation_type, last_seen_at) "
+                "VALUES (?, ?, ?, 1, ?, ?)",
+                (source_id, target_id, min(1.0, delta), relation_type, now)
             )
 
 
@@ -408,32 +418,43 @@ def spreading_activation_search(
         return []
 
     activation: dict[str, float] = {}
-    processed: set[str] = set()
 
     # Initialize activation from seeds
     for eid, score in seed_entities:
         activation[eid] = min(1.0, score)
 
-    # Spread one hop
+    # 推荐 4 (graph-memory 借鉴): 用个性化 PageRank 做多跳实体重要性扩散,
+    # 取代单跳传播 (能沿 2+ 跳关联, 更稳); PPR 失败/无 eg_edges 时回退 1-hop。
     with eg_conn() as c:
         seed_ids = [eid for eid, _ in seed_entities]
-        placeholders = ",".join("?" * len(seed_ids))
-
-        # Get outgoing edges from seed entities
-        edges = c.execute(
-            f"""SELECT source_entity_id, target_entity_id, weight
-                FROM eg_edges
-                WHERE source_entity_id IN ({placeholders})""",
-            seed_ids
-        ).fetchall()
-
-        for edge in edges:
-            src = edge["source_entity_id"]
-            tgt = edge["target_entity_id"]
-            spread = activation.get(src, 0.0) * edge["weight"] * SPREAD_FACTOR
-            if spread > 0.01:
-                current = activation.get(tgt, 0.0)
-                activation[tgt] = min(1.0, current + spread)
+        try:
+            from v5.graph_rank import personalized_pagerank
+            all_edges = c.execute(
+                "SELECT source_entity_id, target_entity_id, weight FROM eg_edges"
+            ).fetchall()
+            ppr = personalized_pagerank(
+                [(e["source_entity_id"], e["target_entity_id"], e["weight"])
+                 for e in all_edges],
+                seed_ids,
+            )
+            for n, s in ppr.items():
+                if s > 1e-9:
+                    activation[n] = max(activation.get(n, 0.0), min(1.0, s))
+        except Exception as exc:
+            logger.debug("spreading_activation: PPR failed (%s), fallback 1-hop", exc)
+            placeholders = ",".join("?" * len(seed_ids))
+            edges = c.execute(
+                f"""SELECT source_entity_id, target_entity_id, weight
+                    FROM eg_edges
+                    WHERE source_entity_id IN ({placeholders})""",
+                seed_ids
+            ).fetchall()
+            for edge in edges:
+                src = edge["source_entity_id"]
+                tgt = edge["target_entity_id"]
+                spread = activation.get(src, 0.0) * edge["weight"] * SPREAD_FACTOR
+                if spread > 0.01:
+                    activation[tgt] = min(1.0, activation.get(tgt, 0.0) + spread)
 
         # Get all episodic memories linked to activated entities
         active_ids = list(activation.keys())

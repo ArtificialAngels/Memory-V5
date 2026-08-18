@@ -9,7 +9,7 @@ memory_retrieval:
   vector_weight: 0.7      # 向量语义分权重
   fts_weight: 0.3         # FTS5 关键词分权重
   time_decay_per_day: 0.05
-  min_fused_score: 0.3    # 融合分阈值, 低于此不注入 (2026-07-26 重新标定: nomic-embed-text-v2-moe 的余弦距离下, 真实语义匹配 fused≈0.3~0.5, 噪声≈0.15; 原 0.6 会把所有有效召回过滤掉导致语义召回失效)
+  min_fused_score: 0.3    # 融合分阈值, 低于此不注入 (2026-07-26 标定于 nomic-embed-text-v2-moe; 2026-08-14 换 bge-m3 后融合尺度不变, 真实语义匹配 fused≈0.3~0.5, 噪声≈0.15; 原 0.6 会把所有有效召回过滤掉导致语义召回失效)
   top_k: 5
   auto_route: true            # unified_retrieve 自动补路: semantic 不足时补图扩散 (阶段1)
   graph_min_score: 0.2        # 图扩散补路的最低分阈值, 低于此丢弃 (防噪音)
@@ -17,19 +17,57 @@ memory_retrieval:
   reinforcement_weight: 0.10  # 阶段4: 用户强化记忆加分 = reinforcement*0.10, cap +0.15
   freshness_weight: 0.08      # 阶段4: 最近 7 天访问过 → +0.08
   long_term_boost: 0.05       # 阶段2: 永久记忆(long_term=1)小幅加分, 防被新记忆挤出
+  # ── 2026-08-14 全套加权 (记忆生命周期 Phase 4) ──
+  base_weight_factor: 0.5     # A: 写侧基础权重进评分: score × (base_weight_factor + (1-f)×weight)
+                              #    1.0 = 完全忽略基础权重(旧行为); 0.5 = 权重 0.9 记忆比 0.6 记忆高 15%
+  merge_reinforce_increment: 0.05  # C: upsert 每次合并强化 +0.05 reinforcement (被合并越多越重要)
+  type_decay:                 # B+E: 每类独立衰减 (per_day 每千分/天, floor 衰减地板)
+    conversation: {per_day: 0.05, floor: 0.2}   # 对话快衰减 (现状)
+    fact: {per_day: 0.03, floor: 0.4}
+    emotion_label: {per_day: 0.05, floor: 0.2}
+    emotional_event: {per_day: 0.04, floor: 0.3}
+    preference: {per_day: 0.02, floor: 0.5}   # 用户偏好保值
+    user_trait: {per_day: 0.01, floor: 0.6}   # 人格理解长期资产, 几乎不衰减
+    identity: {per_day: 0.005, floor: 0.7}    # 自我认同基本不衰减
+    decision: {per_day: 0.005, floor: 0.7}    # 项目决策长期保值
+    lesson: {per_day: 0.01, floor: 0.6}       # 项目教训保值
+    convention: {per_day: 0.005, floor: 0.7}
+    pitfall: {per_day: 0.005, floor: 0.7}
+    default: {per_day: 0.05, floor: 0.2}
+  situational:                # D: 情境加权 (接 context_anchor; enabled=false 则全关)
+    enabled: true
+    project_activity_boost: 0.10  # 前台窗口=写代码/IDE/终端 → 带 v5_project 标签的记忆加分
+    hour_match_boost: 0.05        # 记忆 created 的小时 ≈ 当前小时 (±1h) → 微加分 (时段联想)
   type_boost:
     emotion: 1.2          # 情感记忆优先
     fact: 1.1
     user_trait: 1.15      # 对哥哥的理解优先 (V5 新增)
     preference: 1.05
-    conversation: 0.8
+    conversation: 1.0     # 2026-08-10 从 0.8 调平: sync_turn 写入的跨会话记忆全是
+                          # conversation, 0.8 降权把中等相关对话(fused≈0.25-0.3)
+                          # 压到 min_fused 阈值以下, 导致跨会话对话记忆召回弱
     default: 1.0
+  intent:                     # E: 意图驱动加权 (mnemon 借鉴): 按查询意图调类型 boost
+    enabled: true
+    why:                      # 问"为什么/原因/如何解决" → 决策/教训/对话(含因果)加权
+                              # 决策 > 教训: 问"怎么解决"时解法(decision)应优先于问题(pitfall)
+      decision: 1.3
+      lesson: 1.1
+      conversation: 1.1
+    when:                     # 问"什么时候/最近/上次" → 对话/事实(时间线)加权
+      conversation: 1.15
+      fact: 1.1
+    entity:                   # 问"什么是/关于/是谁" → 实体相关(事实/偏好/身份)加权
+      fact: 1.2
+      preference: 1.1
+      identity: 1.1
+    general: {}               # 默认无偏向
 
 summary:
   trigger_rounds: 20      # 历史轮次超过此值才压缩旧轮
   reuse_rounds: 10        # N 轮内复用上次摘要
   max_age_rounds: 30      # 摘要超过此轮数旧则丢弃
-  model: local-llm
+  # model: (已废弃) 摘要压缩固定走云端 deepseek (reflect.llm_client provider="deepseek")
   max_sentences: 3
   timeout_s: 5
 

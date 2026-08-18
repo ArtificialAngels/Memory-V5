@@ -13,29 +13,15 @@ if str(V5_ROOT.parent) not in sys.path:
 from v5 import store as _store
 
 
-def _val(row, key, default=None):
-    """Read a column from either a sqlite3.Row or a Memory dataclass."""
-    try:
-        return row[key]
-    except Exception:  # noqa: BLE001
-        try:
-            return getattr(row, key)
-        except Exception:  # noqa: BLE001
-            return default
-
-
 def _row_to_dict(row) -> dict:
-    return {
-        "id": _val(row, "id"),
-        "content": _val(row, "content", ""),
-        "type": _val(row, "type", "fact"),
-        "tags": _val(row, "tags") or "",
-        "weight": float(_val(row, "weight", 0.6)),
-        "created": _val(row, "created", 0.0),
-        "pad_p": float(_val(row, "pad_p", 0.0)),
-        "pad_a": float(_val(row, "pad_a", 0.0)),
-        "pad_d": float(_val(row, "pad_d", 0.0)),
-    }
+    """行 → 统一结果字典 (P6 收敛: 委托 memory_retrieval._norm, 结果形状唯一).
+
+    结构化精确匹配 (tag/domain/key) 的输出标记 source="structured" (非语义融合)。
+    """
+    from v5.memory_retrieval import _norm
+    d = _norm(row)
+    d["source"] = "structured"
+    return d
 
 
 class V5MemoryAPI:
@@ -75,7 +61,9 @@ class V5MemoryAPI:
             tag_set.append(f"v5_key:{key}")
         combined_tags = ",".join(dict.fromkeys(tag_set))
 
-        return _store.store(
+        # 2026-08-14 Phase 1: 走 upsert 写策略 (同类相似 → 合并强化, 否则新建),
+        # 根治"永远 INSERT"的雷同膨胀; 对话/事实/笔记均可受益。
+        return _store.upsert(
             content=content,
             type=memory_type,
             weight=max(0.0, min(1.0, float(importance))),
@@ -97,7 +85,7 @@ class V5MemoryAPI:
         fuse: bool = True,
         top_k: int = 5,
         time_range: tuple = None,
-        min_score: float = 0.6,
+        min_score: Optional[float] = None,
     ) -> list[dict]:
         """Search memory.
 
@@ -105,6 +93,12 @@ class V5MemoryAPI:
         do an exact tag match against SQLite (works without ChromaDB).
         Otherwise, when `fuse=True`, runs the 3-way fused semantic retrieval;
         on any failure it falls back to FTS5 keyword search.
+
+        R8 (M6): min_score 现在是真正的融合分下限 —— 对 unified_retrieve 返回的
+        score 字段做后置过滤 (过滤后为空则如实返回 []); None = 不过滤, 沿用配置层
+        min_fused_score (线上 0.3)。历史默认 0.6 会把 FTS-only 命中 (融合分
+        0.3~0.4, 见 preprocess_config.yaml 2026-07-26 标定注释) 全部滤掉, 导致
+        语义召回打空, 故默认改为 None, 由调用方按需收紧。
         """
         # 1) exact / structured path
         if domain or key or tags or type or category_path:
@@ -154,6 +148,13 @@ class V5MemoryAPI:
                                          time_range=tr, min_weight=0.0)
 # 内联说明见 docs/scripts/core/v5/v5/memory_api.md（见“内联注释摘录”）
                 if fused:
+                    if min_score is not None and min_score > 0:
+                        # R8 (M6): min_score 后置过滤生效 —— 过滤后为空则如实
+                        # 返回空列表 (尊重调用方下限, 不回退到未过滤的 FTS5 路径)。
+                        fused = [r for r in fused
+                                 if float(r.get("score", 0.0)) >= min_score]
+                        if not fused:
+                            return []
                     return fused
             except Exception:  # noqa: BLE001
                 pass

@@ -83,6 +83,17 @@ def v5_project_note(
         pad_a=float(pad_a),
         pad_d=float(pad_d),
     )
+    # V5.7: 自动建类型化项目边 (fire-and-forget, 纯规则无 LLM)
+    try:
+        import threading
+        from v5.project_edges import auto_link_project_note
+        threading.Thread(
+            target=auto_link_project_note,
+            args=(mid, content, kind, project),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
     return dumps({"ok": True, "memory_id": mid, "kind": kind, "project": project})
 
 
@@ -94,6 +105,7 @@ def v5_project_retrieve(
     kind: str = None,
     query: str = None,
     top_k: int = 8,
+    with_links: bool = False,
 ) -> str:
     """Retrieve project memory: decisions / pitfalls / conventions / ideas.
 
@@ -106,6 +118,7 @@ def v5_project_retrieve(
         kind: optional filter — decision | pitfall | convention | idea | None(全部)
         query: optional keyword to narrow results
         top_k: max memories to return (default 8)
+        with_links: True 时每条附带类型化邻居 (SOLVES/PREVENTS/CAUSED_BY/RELATES_TO)
     """
     from v5.memory_api import V5MemoryAPI
 
@@ -138,13 +151,26 @@ def v5_project_retrieve(
         _tags = [t for t in (r.get("tags") or "").split(",") if t.strip()]
         _kind = next((t.split(":", 1)[1] for t in _tags
                       if t.startswith("v5_kind:")), r.get("type"))
-        items.append({
+        _item = {
             "id": r.get("id"),
             "kind": _kind,
             "content": (r.get("content") or "")[:200],
             "weight": r.get("weight") or r.get("importance"),
             "created": r.get("created"),
-        })
+        }
+        # P8 可观测性: why 说明 (结构化精确命中 + kind)
+        try:
+            from v5.memory_retrieval import explain_result
+            _item["why"] = explain_result({**r, "kind": _kind, "source": "structured"})
+        except Exception:
+            pass
+        if with_links:
+            try:
+                from v5.project_edges import traverse
+                _item["links"] = traverse(r.get("id"), depth=1)
+            except Exception:
+                _item["links"] = []
+        items.append(_item)
     return dumps({"ok": True, "count": len(items), "items": items})
 
 

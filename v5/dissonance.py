@@ -17,7 +17,9 @@ sys.path.insert(0, str(V5_ROOT.parent))
 # 只对 fact/preference 类记忆做失调检测 (identity 太核心, 先不做)
 _CHECK_TYPES = {"fact", "preference"}
 # 最小语义相似度阈值 (低于此值的旧记忆不纳入比较)
-_MIN_SIMILARITY = 0.4
+# 2026-08-14 P1 收敛: 检索切到 unified_retrieve, score 为融合分 (真实匹配≈0.3~0.5),
+# 阈值从旧 fused_search 尺度的 0.4 调为融合尺度 0.3。
+_MIN_SIMILARITY = 0.3
 
 _NLI_PROMPT = """你是认知失调检测器。判断新信息是否与旧记忆矛盾。
 
@@ -49,10 +51,10 @@ def detect_dissonance(
     if mem_type not in _CHECK_TYPES:
         return {"conflicts": [], "checked": 0, "elapsed_ms": 0}
 
-    # 1) 语义搜索相似旧记忆
+    # 1) 语义搜索相似旧记忆 (P1 收敛: 统一走 unified_retrieve, 弃用旧 fused_search)
     try:
-        from v5.search import fused_search
-        similar = fused_search(content, top_k=top_k)
+        from v5.memory_retrieval import unified_retrieve
+        similar = unified_retrieve(content, top_k=top_k, scope="auto")
     except Exception as exc:
         logger.debug("dissonance: search failed (%s)", exc)
         return {"conflicts": [], "checked": 0, "elapsed_ms": (time.time() - t0) * 1000}

@@ -14,17 +14,15 @@ logger = logging.getLogger("ikaros.v5.self_discovery")
 # 项目根
 IKAROS_ROOT = Path(__file__).resolve().parent.parent.parent  # resolves to Ikaros repo root (core/v5/ -> core/ -> root)
 sys.path.insert(0, str(IKAROS_ROOT / "core"))
-HERMES_EXE = IKAROS_ROOT / "core" / "hermes" / "venv" / "Scripts" / "hermes.exe"
 
 # 每次读哪些文件来了解自己
 _SELF_DISCOVERY_SOURCES = [
     "AGENTS.md",
     "README.md",
     "ikaros-identity/axiom.md",
-    "docs/hermes-agent-full-survey.md",
     "docs/v5-architecture-review.md",
-    "Ikaros-memory/v5/self_model.py",
-    "Ikaros-memory/v5/metacog.py",
+    "core/v5/self_model.py",
+    "core/v5/metacog.py",
 ]
 
 
@@ -45,7 +43,7 @@ def _read_sources() -> str:
 def _analyze(materials: str) -> Optional[dict]:
     """用本地 qwen2.5-7b 分析项目结构, 产出结构化发现.
 
-    比调 Hermes Agent 快得多 (3-5s vs 30-120s),
+    比调完整 Agent 快得多,
     且不消耗云端 token。
     """
     prompt = (
@@ -88,7 +86,7 @@ def self_discover() -> int:
         text = f"[自我探索] {analysis['analysis']}"
         mid = store.store(
             text, type="self_discovery", weight=0.85,
-            tags="self_discovery,hermes,architecture",
+            tags="self_discovery,architecture",
         )
         logger.info("self_discovery: stored id=%d (%d chars)", mid, len(text))
         return 1

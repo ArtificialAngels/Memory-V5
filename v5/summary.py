@@ -21,8 +21,10 @@ _COMPRESS_SYSTEM = (
 
 
 def _defaults() -> dict:
+    # 2026-08-14: 移除死字段 model (摘要压缩始终走云端 deepseek, 见 _compress
+    # 的 provider="deepseek"; 原 model: local-llm 与代码不一致, 已删)
     return {"trigger_rounds": 20, "reuse_rounds": 10, "max_age_rounds": 30,
-            "model": "local-llm", "max_sentences": 3, "timeout_s": 5}
+            "max_sentences": 3, "timeout_s": 5}
 
 
 def _cfg() -> dict:
@@ -66,6 +68,7 @@ def _compress(old_turns: list[str], max_sentences: int, timeout: int) -> Optiona
     text = "\n".join(old_turns)
     try:
         from v5.reflect.llm_client import call_llm
+        # 摘要压缩固定走云端 deepseek (与决策 A 一致: 本地 :8080 不参与认知管线)
         resp = call_llm(
             _COMPRESS_SYSTEM.format(n=max_sentences),
             f"对话记录：\n{text}",

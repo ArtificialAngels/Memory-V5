@@ -23,6 +23,8 @@ from v5.tools import repeat_tool
 from v5.tools import directive_tool
 # V5.4: project track (decisions / pitfalls / conventions)
 from v5.tools import project_tool
+# V5.5: skill track (agent-distilled reusable workflows, Markdown files)
+from v5.tools import skill_tool
 
 # Collect every v5_* callable from the submodules into __all__.
 __all__: list[str] = []
@@ -31,6 +33,7 @@ for _mod in (
     emotion_tool, memory_tool, self_tool,
     care_tool, vitality_tool, relationship_tool, extra_tool,
     reflection_tool, repeat_tool, directive_tool, project_tool,
+    skill_tool,
 ):
     for _name in dir(_mod):
         if _name.startswith("v5_") and _name not in _SEEN:

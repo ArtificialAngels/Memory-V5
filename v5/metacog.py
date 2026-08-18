@@ -86,35 +86,23 @@ _USER_REFLECTION_SYSTEM = """你在独自反省——没有任何人在跟你对
 
 def _llm(system: str, user: str, *, provider: str = "auto",
          temperature: float = 0.85, max_tokens: int = 500) -> Optional[str]:
-    """Unified LLM call (Hermes Dashboard WS first, fallback to direct LLM).
+    """Unified LLM call — 一律走云端 DeepSeek（本地小模型已从 V5 剔除）。
 
-    Default provider="auto":
-      1. Go through Hermes Dashboard WS (hermes_prompt_sync, unified via Hermes)
-      2. If Hermes unavailable or session missing, fallback to cloud (DeepSeek)
-      3. If cloud also fails, raise exception (no silent failure).
-    Explicit provider="deepseek" means direct cloud call. (local 小模型已从 V5 剔除)
+    2026-08-14 修复：provider="auto" 旧路径经 Hermes Dashboard WS
+    (bin.cloud_chat.hermes_prompt_sync) 随重构删除（bin/cloud_chat.py 移除），
+    ImportError 被外层 try 吞掉导致静默返回 None —— auto 现等价 deepseek，
+    直连云端 DeepSeek，恢复 v5_self_reflect / reflect_once 默认路径。
     """
     try:
         if provider == "auto":
-            from bin.cloud_chat import hermes_prompt_sync, warm_hermes_session
-            import asyncio
-            try:
-                asyncio.run(warm_hermes_session())
-            except Exception:
-                pass
-            return hermes_prompt_sync(system, user,
-                                      max_tokens=max_tokens,
-                                      temperature=temperature)
-        elif provider == "deepseek":
+            provider = "deepseek"
+        if provider == "deepseek":
             from v5.reflect.llm_client import call_llm
             resp = call_llm(system, user, provider="deepseek",
                             temperature=temperature, max_tokens=max_tokens)
             return resp.content.strip() if resp and resp.content else None
-        else:  # deepseek (local 小模型已剔除)
-            from v5.reflect.llm_client import call_llm
-            resp = call_llm(system, user, provider="deepseek",
-                            temperature=temperature, max_tokens=max_tokens)
-            return resp.content.strip() if resp and resp.content else None
+        logger.warning("metacog LLM unknown provider: %s", provider)
+        return None
     except Exception as exc:
         logger.warning("metacog LLM failed (provider=%s): %s", provider, exc)
         return None
@@ -150,10 +138,11 @@ def _search_theme(keywords: str, top_k: int = 3) -> list[str]:
     """
     _ALLOWED_TYPES = {"fact", "lesson", "preference", "identity", "emotional_event"}
     try:
-        from v5.search import fused_search
+        # P1 收敛: 统一走 unified_retrieve (弃用旧 fused_search)
+        from v5.memory_retrieval import unified_retrieve
         # Use the most representative keyword for search
         kw = keywords.split()[0]
-        rows = fused_search(kw, top_k=top_k)
+        rows = unified_retrieve(kw, top_k=top_k, scope="auto")
         return [r.get("content", "")[:80].replace("\n", " ")
                 for r in rows if r.get("type") in _ALLOWED_TYPES]
     except Exception:

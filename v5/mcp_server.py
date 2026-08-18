@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# See docs/scripts/core/v5/v5/mcp_server.md
+"""MCP server — 把 V5 记忆引擎以 MCP 协议暴露给外部 agent (dsh / pi 等).
+
+提供 48 个 v5_* 工具 (v5_memory_search/store/self_model/relationship 等),
+由 v5.tools.* 注册; 经 stdio transport 与客户端通信。
+见 docs/scripts/core/v5/v5/mcp_server.md
+"""
 
 from __future__ import annotations
 
@@ -109,7 +114,95 @@ from v5.tools import (  # noqa: E402
     v5_activity_status, v5_context_compression_stats,
     # V5.4: project track
     v5_project_note, v5_project_retrieve, v5_project_stats,
+    # V5.5: skill track
+    v5_skill_write, v5_skill_list, v5_skill_get,
+    v5_skill_search, v5_skill_remove,
 )
+
+# ── 工具分组元数据 (docs/hermes-tools-scoping.md Option 2) ─────────
+# 7 组 48 工具; emotion/narrative/proactive/activity 归入 self, 与 FastMCP
+# instructions 的分组语义一致. 未分组的新工具默认全组可见 (不参与过滤),
+# 避免 "新工具静默不可见" (见 scoping 文档风险表).
+_VALID_GROUPS = ("memory", "self", "care", "vitality", "relationship", "skill", "project")
+
+_TOOL_GROUPS: dict[str, str] = {
+    # memory (21)
+    "v5_memory_store": "memory", "v5_memory_search": "memory",
+    "v5_memory_get": "memory", "v5_memory_delete": "memory",
+    "v5_memory_stats": "memory", "v5_dissonance_check": "memory",
+    "v5_context_compression_stats": "memory",
+    "v5_directive_add": "memory", "v5_directive_list": "memory",
+    "v5_directive_deactivate": "memory", "v5_directive_stats": "memory",
+    "v5_anti_repeat_record": "memory", "v5_anti_repeat_check": "memory",
+    "v5_anti_repeat_penalty": "memory", "v5_anti_repeat_clear": "memory",
+    "v5_anti_repeat_stats": "memory",
+    "v5_reflection_synthesize": "memory", "v5_reflection_read": "memory",
+    "v5_reflection_apply_evidence": "memory", "v5_reflection_promote": "memory",
+    "v5_reflection_stats": "memory",
+    # self (13)
+    "v5_analyze_emotion": "self", "v5_emotion_status": "self",
+    "v5_emotion_label": "self", "v5_self_model": "self",
+    "v5_self_reflect": "self", "v5_self_discover": "self",
+    "v5_latest_thought": "self", "v5_curiosity_check": "self",
+    "v5_subconscious": "self", "v5_reflect_run_op": "self",
+    "v5_narrative_generate": "self", "v5_proactive_check": "self",
+    "v5_activity_status": "self",
+    # care (2)
+    "v5_care_check": "care", "v5_care_status": "care",
+    # vitality (2)
+    "v5_vitality": "vitality", "v5_vitality_tick": "vitality",
+    # relationship (2)
+    "v5_relationship": "relationship", "v5_relationship_tick": "relationship",
+    # skill (5)
+    "v5_skill_write": "skill", "v5_skill_list": "skill",
+    "v5_skill_get": "skill", "v5_skill_search": "skill",
+    "v5_skill_remove": "skill",
+    # project (3)
+    "v5_project_note": "project", "v5_project_retrieve": "project",
+    "v5_project_stats": "project",
+}
+
+
+def _parse_tool_groups(env_value: str | None) -> set[str] | None:
+    """解析 V5_MCP_TOOL_GROUPS 环境变量 → 允许的工具组集合.
+
+    未设置 / 空 / 含非法组名 → 返回 None (fail-open: 全量注册, 不破坏现有行为).
+    返回 None 或全量集合时, 注册循环不做过滤.
+    """
+    if env_value is None:
+        return None
+    names = [n.strip() for n in env_value.split(",") if n.strip()]
+    if not names:
+        return None
+    unknown = sorted(set(names) - set(_VALID_GROUPS))
+    if unknown:
+        logger.warning(
+            "V5_MCP_TOOL_GROUPS contains unknown group(s) %s; ignoring filter "
+            "and registering all tools (fail-open)", unknown)
+        return None
+    return set(names)
+
+
+def _register_tools(mcp_obj, env_value: str | None = None) -> None:
+    """按 V5_MCP_TOOL_GROUPS 过滤 _NEW_V5_TOOLS 并注册到 mcp_obj.
+
+    env_value=None/空/非法组 → 全量注册 (行为与旧循环一致).
+    被过滤的工具跳过 add_tool, 记 debug 日志.
+    """
+    groups = _parse_tool_groups(env_value)
+    for _tool_fn in _NEW_V5_TOOLS:
+        _name = getattr(_tool_fn, "__name__", str(_tool_fn))
+        _group = _TOOL_GROUPS.get(_name)
+        # 未分组的工具视为全组可见, 不参与过滤 (与文档约定一致)
+        if groups is not None and _group is not None and _group not in groups:
+            logger.debug("skip tool %s (group %s not in V5_MCP_TOOL_GROUPS=%s)",
+                         _name, _group, env_value)
+            continue
+        try:
+            mcp_obj.add_tool(_tool_fn)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("failed to register tool %s: %s", _name, _e)
+
 
 _NEW_V5_TOOLS = [
     v5_analyze_emotion, v5_emotion_status, v5_emotion_label,
@@ -134,13 +227,12 @@ _NEW_V5_TOOLS = [
     v5_activity_status, v5_context_compression_stats,
     # V5.4: project track
     v5_project_note, v5_project_retrieve, v5_project_stats,
+    # V5.5: skill track (agent-distilled reusable workflows, Markdown files)
+    v5_skill_write, v5_skill_list, v5_skill_get,
+    v5_skill_search, v5_skill_remove,
 ]
-for _tool_fn in _NEW_V5_TOOLS:
-    try:
-        mcp.add_tool(_tool_fn)
-    except Exception as _e:  # noqa: BLE001
-        logger.warning("failed to register tool %s: %s",
-                       getattr(_tool_fn, "__name__", _tool_fn), _e)
+# V5_MCP_TOOL_GROUPS=memory,self,... 过滤注册; 未设置/空/非法 → 全量 (fail-open)
+_register_tools(mcp, os.environ.get("V5_MCP_TOOL_GROUPS"))
 
 
 # ── Entry point ────────────────────────────────────────────────────

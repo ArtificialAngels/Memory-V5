@@ -37,7 +37,188 @@ def _defaults() -> dict:
         "vector_weight": 0.7, "fts_weight": 0.3,
         "time_decay_per_day": 0.05, "min_fused_score": 0.6, "top_k": 5,
         "type_boost": {"emotion": 1.2, "fact": 1.1, "conversation": 0.8, "default": 1.0},
+        # Phase 4 全套加权默认值 (与 preprocess_config.yaml 一致; 无配置时兜底)
+        "base_weight_factor": 0.5,
+        "merge_reinforce_increment": 0.05,
+        "type_decay": {
+            "conversation": {"per_day": 0.05, "floor": 0.2},
+            "fact": {"per_day": 0.03, "floor": 0.4},
+            "user_trait": {"per_day": 0.01, "floor": 0.6},
+            "identity": {"per_day": 0.005, "floor": 0.7},
+            "preference": {"per_day": 0.02, "floor": 0.5},
+            "decision": {"per_day": 0.005, "floor": 0.7},
+            "lesson": {"per_day": 0.01, "floor": 0.6},
+            "default": {"per_day": 0.05, "floor": 0.2},
+        },
+        "situational": {
+            "enabled": True,
+            "project_activity_boost": 0.10,
+            "hour_match_boost": 0.05,
+        },
     }
+
+
+# ─── 意图检测 (mnemon 借鉴: WHY/WHEN/ENTITY/GENERAL) ──────────────
+# 查询意图决定检索时哪类记忆加权更重 (问 why → 决策/教训; 问 when → 时间;
+# 问 X → 实体图扩散)。纯 regex, 零 LLM 成本, fail-safe 默认 GENERAL。
+
+_INTENT_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("WHY", ("为什么", "为何", "原因", "理由", "动机", "怎么解决", "如何解决",
+             "怎么修", "如何修", "why", "because", "reason", "cause", "导致")),
+    ("WHEN", ("什么时候", "何时", "时间", "多久", "最近", "上次", "哪天", "几月",
+              "几号", "when", "before", "after", "timeline", "时间线")),
+    ("ENTITY", ("什么是", "是谁", "关于", "介绍", "哪个", "哪些", "what is",
+                "who is", "tell me about", "讲讲")),
+]
+_INTENTS = ("WHY", "WHEN", "ENTITY", "GENERAL")
+
+
+def detect_intent(query: str) -> str:
+    """检测查询意图 (mnemon 式意图识别, 纯规则). 返回 WHY/WHEN/ENTITY/GENERAL."""
+    q = (query or "").strip().lower()
+    if not q:
+        return "GENERAL"
+    for intent, kws in _INTENT_PATTERNS:
+        for kw in kws:
+            if kw in q:
+                return intent
+    return "GENERAL"
+
+
+def _score_items(
+    merged: dict[str, dict],
+    mr: dict,
+    *,
+    now: float | None = None,
+    sit_ctx: dict | None = None,
+    coding_activity: bool = False,
+    excl: list[str] | None = None,
+    min_fused: float = 0.3,
+    tk: int = 5,
+    intent: str = "GENERAL",
+) -> list[dict]:
+    """融合评分 (Phase 4 全套加权; 纯函数, 可单测).
+
+    fused = 语义相关分(raw)
+          × 基础权重因子(A: bwf + (1-bwf)×weight)
+          × 类型化衰减(B+E: 每类 per_day/floor, 人格/项目保值)
+          × 类型 boost
+          × (1 + 频率/强化/新鲜度/长期)
+          × 情境(D: 写代码→v5_project 加分; 时段联想→created 小时≈now 加分)
+    返回按 score 降序、≥min_fused 的 top tk 列表。
+    """
+    import time as _t
+    now = _t.time() if now is None else now
+    excl = [e for e in (excl or []) if e]
+    boosts = mr.get("type_boost", {}) or {}
+    bwf = float(mr.get("base_weight_factor", 1.0))
+    td_cfg = mr.get("type_decay", {}) or {}
+    fw_cfg = float(mr.get("frequency_weight", 0.0))
+    rw_cfg = float(mr.get("reinforcement_weight", 0.0))
+    frs_cfg = float(mr.get("freshness_weight", 0.0))
+    lt_cfg = float(mr.get("long_term_boost", 0.0))
+    sit_cfg = mr.get("situational", {}) or {}
+    proj_boost = float(sit_cfg.get("project_activity_boost", 0.0))
+    hour_boost = float(sit_cfg.get("hour_match_boost", 0.0))
+    sit_enabled = bool(sit_cfg.get("enabled", True))
+    # E: 意图驱动加权 (mnemon 借鉴): 按查询意图调类型 boost; enabled=false 不加
+    intent_cfg = mr.get("intent", {}) or {}
+    intent_enabled = bool(intent_cfg.get("enabled", False))
+    intent_boosts = (intent_cfg.get(intent.lower(), {}) or {}) if intent_enabled else {}
+
+    out: list[dict] = []
+    for item in merged.values():
+        fused = float(item["raw"])
+        itype = item.get("type", "default")
+        base_factor = 1.0
+        decay_factor = 1.0
+        type_boost_factor = 1.0
+        freq_amount = 0.0
+        sit_amount = 0.0
+        # A: 写侧基础权重进评分 (bwf=1.0 时完全忽略, 保持旧行为)
+        if bwf < 1.0:
+            base_factor = bwf + (1.0 - bwf) * float(item.get("weight", 0.5))
+            fused *= base_factor
+        # B+E: 类型化衰减 (conversation 快衰减, user_trait/identity/decision 保值)
+        if item.get("source") != "time" and item.get("created"):
+            days = (now - float(item["created"])) / 86400.0
+            if days > 0:
+                tdc = td_cfg.get(itype, td_cfg.get("default", {"per_day": 0.05, "floor": 0.2}))
+                pd = float(tdc.get("per_day", 0.05))
+                fl = float(tdc.get("floor", 0.2))
+                decay_factor = max(fl, 1.0 - pd * days)
+                fused *= decay_factor
+        b = boosts.get(itype, boosts.get("default", 1.0))
+        if intent_boosts:
+            b *= float(intent_boosts.get(itype, intent_boosts.get("default", 1.0)))
+        type_boost_factor = b
+        fused *= b
+        # 频率/反馈/新鲜度/永久库 boost
+        if fused > 0 and (fw_cfg or rw_cfg or frs_cfg or lt_cfg):
+            boost = 0.0
+            ac = int(item.get("access_count", 0))
+            if fw_cfg and ac > 0:
+                boost += min(0.25, (ac + 1).bit_length() * fw_cfg)
+            if rw_cfg and item.get("reinforcement", 0.0) > 0:
+                boost += min(0.15, float(item["reinforcement"]) * rw_cfg)
+            if frs_cfg and item.get("last_accessed", 0.0) > 0 and \
+                    (now - float(item["last_accessed"])) < 7 * 86400.0:
+                boost += frs_cfg
+            if lt_cfg and item.get("long_term"):
+                boost += lt_cfg
+            if boost:
+                freq_amount = boost
+                fused *= (1.0 + boost)
+        # D: 情境加权 (enabled=false 或未提供上下文 → 不加)
+        if fused > 0 and sit_enabled and sit_ctx is not None:
+            sit_boost = 0.0
+            if proj_boost and coding_activity and "v5_project" in (item.get("tags") or ""):
+                sit_boost += proj_boost
+            if hour_boost and item.get("created"):
+                try:
+                    import datetime as _dt
+                    ch = _dt.datetime.fromtimestamp(float(item["created"])).hour
+                    nh = _dt.datetime.fromtimestamp(now).hour
+                    if abs(ch - nh) <= 1 or abs(ch - nh) >= 23:  # ±1h 或跨午夜
+                        sit_boost += hour_boost
+                except Exception:
+                    pass
+            if sit_boost:
+                sit_amount = sit_boost
+                fused *= (1.0 + sit_boost)
+        item["score"] = fused
+        item["intent"] = intent
+        # P2 统一重要性: EI 透出 (与 lifecycle/upsert 同一口径 importance.effective_importance)
+        try:
+            from v5.importance import effective_importance as _ei_fn
+            _ei_val = round(_ei_fn(item.get("weight", 0.5), item.get("access_count", 0),
+                                   item.get("last_accessed", 0.0), now,
+                                   item.get("reinforcement", 0.0)), 4)
+        except Exception:
+            _ei_val = 0.0
+        # 信号透明 (mnemon 借鉴): 暴露评分各分量, 供上层/LLM 自主重排与解释
+        item["signals"] = {
+            "fts": round(float(item.get("fts_raw", 0.0)), 4),
+            "vector": round(float(item.get("vec_raw", 0.0)), 4),
+            "time": round(float(item.get("time_raw", 0.0)), 4),
+            "base_weight": round(base_factor, 4),
+            "type_decay": round(decay_factor, 4),
+            "type_boost": round(type_boost_factor, 4),
+            "frequency": round(freq_amount, 4),
+            "situational": round(sit_amount, 4),
+            "ei": _ei_val,
+        }
+        # 去重已知信息 (子串重叠)
+        if excl:
+            for ex in excl:
+                if ex and (ex in item["content"] or item["content"] in ex):
+                    item["score"] = -1.0
+                    break
+        out.append(item)
+
+    out = [x for x in out if x["score"] >= min_fused]
+    out.sort(key=lambda x: -x["score"])
+    return out[:tk]
 
 
 def retrieve(
@@ -48,6 +229,7 @@ def retrieve(
     exclude: list[str] | None = None,
     min_weight: float = 0.0,
     character: str = '',
+    intent: str | None = None,
 ) -> list[dict]:
     """三路融合检索, 返按 fused_score 降序的 list[dict].
 
@@ -58,9 +240,12 @@ def retrieve(
     if not query or not query.strip():
         return []
 
+    # 意图检测 (mnemon 借鉴; 显式传入则跳过自动检测)
+    intent = detect_intent(query) if intent is None else intent
+
     # 检索结果短 TTL 缓存
     ttl = _retrieve_ttl()
-    cache_key = (query, top_k, time_range, tuple(exclude or []), character)
+    cache_key = (query, top_k, time_range, tuple(exclude or []), character, intent)
     if ttl > 0:
         with _RET_CACHE_LOCK:
             hit = _RET_CACHE.get(cache_key)
@@ -79,6 +264,7 @@ def retrieve(
     min_fused = float(mr["min_fused_score"])
     tk = int(top_k or mr["top_k"])
     boosts = mr["type_boost"]
+    # Phase 4 全套加权参数由 _score_items 内部读取 mr (纯函数, 可单测)
 
     # ── ① FTS5 关键词 ──
     fts_list: list = []
@@ -94,6 +280,13 @@ def retrieve(
     try:
         from v5.search import get_vector_index
         vec_list = get_vector_index().search(query, top_k=max(tk * 2, 6))
+        if not vec_list:
+            # 兜底: 单例可能持有旧快照, 或新记忆向量还在 Chroma WAL 未应用
+            # (compaction 无 vision 模型被跳过). 强制刷新重建实例(从持久化
+            # 重放)后重查一次, 消除新记忆 30s 语义不可见窗口。失败由 except
+            # 兜住, 不影响 FTS 路。
+            vec_list = get_vector_index(refresh=True).search(
+                query, top_k=max(tk * 2, 6))
     except Exception as e:
         logger.debug("vector search failed: %s", e)
 
@@ -115,17 +308,25 @@ def retrieve(
         if key in merged:
             # 同一记忆多路命中 → 累加分量 (0.7 向量分量 + 0.3 FTS5 分量 = 融合分)
             merged[key]["raw"] += raw
+            if source in ("fts", "vec", "time"):
+                merged[key][f"{source}_raw"] = float(merged[key].get(f"{source}_raw", 0.0)) + float(raw)
             return
         merged[key] = {
             "id": key, "content": content, "type": mtype, "weight": weight,
-            "tags": "", "created": created, "pad_p": pad_p, "pad_a": pad_a,
+            # Phase 4: tags 透传 (情境加权需要 v5_project 判断)
+            "tags": extra.get("tags", "") or "",
+            "created": created, "pad_p": pad_p, "pad_a": pad_a,
             "source": source, "raw": raw,
+            # 各路原始贡献 (信号透明: 哪些路径命中、各贡献多少)
+            "fts_raw": 0.0, "vec_raw": 0.0, "time_raw": 0.0,
             # 阶段 4: 频率/反馈字段透传 (排序用; 未暴露时默认 0)
             "access_count": int(extra.get("access_count", 0)),
             "reinforcement": float(extra.get("reinforcement", 0.0)),
             "last_accessed": float(extra.get("last_accessed", 0.0)),
             "long_term": bool(extra.get("long_term", False)),
         }
+        if source in ("fts", "vec", "time"):
+            merged[key][f"{source}_raw"] = float(raw)
 
     for i, m in enumerate(fts_list):
         _add(m.id, m.content, m.type, m.weight, m.created,
@@ -133,7 +334,8 @@ def retrieve(
              access_count=getattr(m, "access_count", 0),
              reinforcement=getattr(m, "reinforcement", 0.0),
              last_accessed=getattr(m, "last_accessed", 0.0),
-             long_term=getattr(m, "long_term", False))
+             long_term=getattr(m, "long_term", False),
+             tags=getattr(m, "tags", ""))
     for r in vec_list:
         _add(r.get("id"), r.get("content", ""), r.get("type", "fact"),
              r.get("weight", 0.5), r.get("created", 0.0),
@@ -141,7 +343,8 @@ def retrieve(
              access_count=r.get("access_count", 0),
              reinforcement=r.get("reinforcement", 0.0),
              last_accessed=r.get("last_accessed", 0.0),
-             long_term=r.get("long_term", False))
+             long_term=r.get("long_term", False),
+             tags=r.get("tags", ""))
     for m in time_list:
         # 时间指代命中是用户明确信号, 给强初始分确保过 min_fused 阈值
         _add(m.id, m.content, m.type, m.weight, m.created,
@@ -149,55 +352,41 @@ def retrieve(
              access_count=getattr(m, "access_count", 0),
              reinforcement=getattr(m, "reinforcement", 0.0),
              last_accessed=getattr(m, "last_accessed", 0.0),
-             long_term=getattr(m, "long_term", False))
+             long_term=getattr(m, "long_term", False),
+             tags=getattr(m, "tags", ""))
 
-    # ── 融合分: 时间衰减 + 类型 boost + 频率/反馈 boost ──
+    # ── 融合分: 基础权重 + 类型化衰减 + 类型 boost + 频率/反馈 + 情境 ──
     now = time.time()
-    # 阶段 4: 频率/反馈权重 (借鉴 cognee apply_feedback_weights; config 可关可调)
-    fw_cfg = float(mr.get("frequency_weight", 0.0))
-    rw_cfg = float(mr.get("reinforcement_weight", 0.0))
-    frs_cfg = float(mr.get("freshness_weight", 0.0))
-    lt_cfg = float(mr.get("long_term_boost", 0.0))
-    excl = [e for e in (exclude or []) if e]
-    out: list[dict] = []
-    for item in merged.values():
-        fused = float(item["raw"])
-        # 时间衰减: 仅作用于 fts/vec 来源 (spec: 衰减不能太激进, 旧偏好仍有效)
-        # 时间指代命中 (source=='time') 本身是用户明确信号, 不叠加衰减
-        if item["source"] != "time" and item["created"]:
-            days = (now - float(item["created"])) / 86400.0
-            if days > 0:
-                fused *= max(0.2, 1.0 - decay * days)  # 下限 0.2, 不归零
-        b = boosts.get(item["type"], boosts.get("default", 1.0))
-        fused *= b
-        # 频率/反馈/新鲜度/永久库 boost (纯加分, 不影响 0 分记忆)
-        if fused > 0 and (fw_cfg or rw_cfg or frs_cfg or lt_cfg):
-            boost = 0.0
-            ac = int(item.get("access_count", 0))
-            if fw_cfg and ac > 0:
-                # log2(ac+1) 近似用 bit_length; cap +0.25
-                boost += min(0.25, (ac + 1).bit_length() * fw_cfg)
-            if rw_cfg and item.get("reinforcement", 0.0) > 0:
-                boost += min(0.15, float(item["reinforcement"]) * rw_cfg)
-            if frs_cfg and item.get("last_accessed", 0.0) > 0 and \
-                    (now - float(item["last_accessed"])) < 7 * 86400.0:
-                boost += frs_cfg
-            if lt_cfg and item.get("long_term"):
-                boost += lt_cfg
-            if boost:
-                fused *= (1.0 + boost)
-        item["score"] = fused
-        # 去重已知信息 (子串重叠)
-        if excl:
-            for ex in excl:
-                if ex and (ex in item["content"] or item["content"] in ex):
-                    item["score"] = -1.0
-                    break
-        out.append(item)
 
-    out = [x for x in out if x["score"] >= min_fused]
-    out.sort(key=lambda x: -x["score"])
-    result = out[:tk]
+    # Phase 4 D: 情境上下文 (每轮检索取一次; 失败则跳过情境加权)
+    sit_ctx = None
+    coding_activity = False
+    sit_cfg = mr.get("situational", {}) or {}
+    if bool(sit_cfg.get("enabled", True)) and (
+            float(sit_cfg.get("project_activity_boost", 0.0))
+            or float(sit_cfg.get("hour_match_boost", 0.0))):
+        try:
+            from v5.context_anchor import now_context
+            sit_ctx = now_context()
+            _act = f"{sit_ctx.get('activity') or ''} {sit_ctx.get('window') or ''}"
+            coding_activity = any(k in _act for k in (
+                "写代码", "终端", "IDE", "VS Code", "PyCharm", "IntelliJ", "Code", "开发"))
+        except Exception:
+            sit_ctx = None
+
+    excl = [e for e in (exclude or []) if e]
+    result = _score_items(merged, mr, now=now, sit_ctx=sit_ctx,
+                          coding_activity=coding_activity,
+                          excl=excl, min_fused=min_fused, tk=tk, intent=intent)
+
+    # ── 关键词兜底: 长句/混合 query FTS+向量双 miss 时, 拆词逐词 FTS 重查 ──
+    # 实测 (2026-08-10): "memU 调研学到了什么" 整句 0 命中, 拆成 "memU"/"调研"
+    # 后各能命中。这是 memU progressive_retrieve 文档里 "reword query" 场景的
+    # 自动版 —— agent 不会每次手动重写 query, 检索层自己兜。
+    # 触发条件: 结果不足 top_k 即补足 (2026-08-10 从 <3 放宽, 避免 3-4 条
+    # 低相关历史记忆占位时特异性 token 命中永远进不来)
+    if len(result) < tk:
+        result = _keyword_fallback(query, result, tk, min_weight, character)
 
     # ── Vault fallback: 本体检索不足时, 去 ThirdSpace Vault 搜 ──
     if len(result) < 3:
@@ -231,23 +420,94 @@ SCOPES = ("auto", "semantic", "lexical", "graph", "tree", "temporal")
 
 # 统一归一化字段 (与 retrieve() 返回一致 + source 标记来源)
 _REQ_FIELDS = ("id", "content", "type", "weight", "tags", "created",
-               "pad_p", "pad_a", "source", "score")
+               "pad_p", "pad_a", "pad_d", "source", "score")
 
 
-def _norm(d: dict) -> dict:
-    """把任意路检索结果归一化成统一字段 (缺省补默认值)."""
+def _val(d, key, default=None):
+    """兼容 dict / sqlite3.Row / store.Memory 的字段访问 (P6 归一化收敛)."""
+    try:
+        return d[key]
+    except Exception:
+        try:
+            return getattr(d, key, default)
+        except Exception:
+            return default
+
+
+def _norm(d) -> dict:
+    """统一归一化 (dict / sqlite3.Row / store.Memory → 统一结果字典).
+
+    P6 收敛 (2026-08-14): 唯一结果形状定义; memory_api._row_to_dict 委托本函数,
+    结构化检索/语义检索/图检索全部输出同一字段集。
+    """
     return {
-        "id": str(d.get("id", "")),
-        "content": d.get("content", "") or "",
-        "type": d.get("type", "fact"),
-        "weight": float(d.get("weight", 0.5) or 0.5),
-        "tags": d.get("tags", "") or "",
-        "created": float(d.get("created", 0.0) or 0.0),
-        "pad_p": float(d.get("pad_p", 0.0) or 0.0),
-        "pad_a": float(d.get("pad_a", 0.0) or 0.0),
-        "source": d.get("source", "semantic"),
-        "score": float(d.get("score", 0.0) or 0.0),
+        "id": _val(d, "id", ""),
+        "content": _val(d, "content", "") or "",
+        "type": _val(d, "type", "fact"),
+        "weight": float(_val(d, "weight", 0.5) or 0.5),
+        "tags": _val(d, "tags", "") or "",
+        "created": float(_val(d, "created", 0.0) or 0.0),
+        "pad_p": float(_val(d, "pad_p", 0.0) or 0.0),
+        "pad_a": float(_val(d, "pad_a", 0.0) or 0.0),
+        "pad_d": float(_val(d, "pad_d", 0.0) or 0.0),
+        "source": _val(d, "source", "semantic"),
+        "score": float(_val(d, "score", 0.0) or 0.0),
+        "access_count": int(_val(d, "access_count", 0) or 0),
+        "reinforcement": float(_val(d, "reinforcement", 0.0) or 0.0),
+        "last_accessed": float(_val(d, "last_accessed", 0.0) or 0.0),
+        "long_term": bool(_val(d, "long_term", False)),
+        "intent": _val(d, "intent", "GENERAL"),
+        "signals": _val(d, "signals") or {},
+        "relation": _val(d, "relation", ""),
+        "kind": _val(d, "kind", ""),
     }
+
+
+def explain_result(item: dict) -> str:
+    """P8 可观测性 (2026-08-14): 从 signals/intent/relation 生成"为什么召回这条"的可读说明.
+
+    供 MCP 工具 (v5_memory_search / v5_project_retrieve) 给每条结果附 `why` 字段,
+    让 pi/Hermes 能看到召回依据 (语义各路径分量 / 图 relation / 意图加权 / EI)。
+    纯函数, 不依赖外部。
+    """
+    parts: list[str] = []
+    sg = item.get("signals") or {}
+    intent = item.get("intent") or "GENERAL"
+    src = item.get("source") or "semantic"
+
+    if src == "semantic":
+        path = []
+        if float(sg.get("vector", 0.0)) > 0:
+            path.append(f"向量{sg['vector']:.2f}")
+        if float(sg.get("fts", 0.0)) > 0:
+            path.append(f"关键词{sg['fts']:.2f}")
+        if float(sg.get("time", 0.0)) > 0:
+            path.append(f"时间{sg['time']:.2f}")
+        parts.append("语义融合(" + "+".join(path) + ")" if path else "语义")
+    elif src in ("graph", "project_graph"):
+        rel = item.get("relation")
+        parts.append(f"图扩散(relation={rel})" if rel and rel != "self" else "图扩散")
+    elif src == "lexical":
+        parts.append("关键词命中")
+    elif src == "structured":
+        parts.append("精确标签命中")
+    elif src == "kw":
+        parts.append("关键词兜底")
+    elif src in ("tree", "temporal", "vault"):
+        parts.append(f"{src}路径")
+
+    if intent != "GENERAL":
+        parts.append(f"意图{intent}")
+    tb = float(sg.get("type_boost", 1.0) or 1.0)
+    if tb and tb != 1.0:
+        parts.append(f"类型加权×{tb}")
+    ei = float(sg.get("ei", 0.0) or 0.0)
+    if ei > 0:
+        parts.append(f"EI={ei:.2f}")
+    if item.get("kind"):
+        parts.append(f"kind={item['kind']}")
+
+    return "，".join(parts) if parts else f"来源{src}"
 
 
 def _route_cfg() -> dict:
@@ -256,6 +516,31 @@ def _route_cfg() -> dict:
         return pc.cfg().get("memory_retrieval", {})
     except Exception:
         return {}
+
+
+def _graph_retrieve(query: str, tk: int, graph_min: float = 0.0) -> list[dict]:
+    """P3 图收敛 (2026-08-14): 统一图检索 = 实体图 + 项目知识图, 一致性收集.
+
+    取代 graph scope / auto 补路里对 entity_graph_search / project_graph_search
+    的重复 OR 拼装。同一张"V5 图"的两个边类型: eg_edges (实体共现) + project_edges
+    (笔记类型化边)。低分 graph 结果按 graph_min 过滤。
+    """
+    out: dict[str, dict] = {}
+    try:
+        from v5.search import entity_graph_search
+        for x in entity_graph_search(query, top_k=tk * 2):
+            if float(x.get("score", 0.0)) >= graph_min:
+                out.setdefault(str(x.get("id")), x)
+    except Exception as e:
+        logger.debug("_graph_retrieve entity failed: %s", e)
+    try:
+        from v5.project_edges import project_graph_search
+        for x in project_graph_search(query, top_k=tk):
+            if float(x.get("score", 0.0)) >= graph_min:
+                out.setdefault(str(x.get("id")), x)
+    except Exception as e:
+        logger.debug("_graph_retrieve project failed: %s", e)
+    return list(out.values())
 
 
 def unified_retrieve(
@@ -289,6 +574,8 @@ def unified_retrieve(
     auto_route = bool(mr.get("auto_route", True))
     tk = int(top_k or mr.get("top_k", 5) or 5)
     graph_min = float(mr.get("graph_min_score", 0.2) or 0.2)
+    intent = detect_intent(query)
+    intent_enabled = bool((mr.get("intent", {}) or {}).get("enabled", False))
     merged: dict[str, dict] = {}
     used: list[str] = []
 
@@ -298,6 +585,7 @@ def unified_retrieve(
         for it in items:
             d = _norm(it)
             d["source"] = src
+            d["intent"] = intent  # 统一带查询意图 (信号透明)
             key = d["id"]
             if not key:
                 continue
@@ -330,9 +618,9 @@ def unified_retrieve(
                                     exclude=exclude, min_weight=min_weight)
 
     elif scope == "graph":
+        # P3 图收敛: 统一图检索 (实体图 + 项目知识图)
         try:
-            from v5.search import entity_graph_search
-            _merge(entity_graph_search(query, top_k=tk * 2), "graph")
+            _merge(_graph_retrieve(query, tk), "graph")
             used.append("graph")
         except Exception as e:
             logger.debug("unified graph failed: %s", e)
@@ -358,9 +646,8 @@ def unified_retrieve(
                                 min_weight=min_weight)
 
     elif scope == "temporal":
-        # 阶段 5: temporal_graph.retrieve_temporal —— 过滤 valid_to 已失效的事实
+        # 阶段 5: retrieve_temporal —— 过滤 valid_to 已失效的事实 (时效图谱)
         try:
-            from v5.extensions.temporal_graph import retrieve_temporal
             _merge(retrieve_temporal(query, top_k=tk * 2, character=character,
                                      time_range=time_range, exclude=exclude,
                                      min_weight=min_weight), "temporal")
@@ -377,7 +664,7 @@ def unified_retrieve(
     sem: list = []
     try:
         sem = retrieve(query, top_k=tk, time_range=time_range, exclude=exclude,
-                       min_weight=min_weight, character=character)
+                       min_weight=min_weight, character=character, intent=intent)
     except Exception as e:
         logger.debug("unified semantic failed: %s", e)
     _merge(sem, "semantic")
@@ -386,12 +673,12 @@ def unified_retrieve(
         return _finish(merged, tk)
 
     # ── auto 补路: semantic 不足时补图扩散 (低分 graph 不过 threshold) ──
-    if len(merged) < 3:
+    # 意图为 ENTITY (问"什么是/关于/是谁") 时总是补实体图扩散 (即使 semantic 已足),
+    # 与 mnemon 的 "ENTITY 意图 → 实体边加权" 一致。
+    if len(merged) < 3 or (intent_enabled and intent == "ENTITY"):
         try:
-            from v5.search import entity_graph_search
-            g = entity_graph_search(query, top_k=tk * 2)
-            g = [x for x in g if float(x.get("score", 0.0)) >= graph_min]
-            _merge(g, "graph")
+            # P3 图收敛: 统一图检索 (实体图 + 项目知识图 + graph_min 过滤)
+            _merge(_graph_retrieve(query, tk, graph_min=graph_min), "graph")
             used.append("graph")
         except Exception as e:
             logger.debug("unified auto graph fallback failed: %s", e)
@@ -399,10 +686,134 @@ def unified_retrieve(
 
 
 def _finish(merged: dict[str, dict], tk: int) -> list[dict]:
-    """排序截断 (fail-open: merged 可能为空)."""
+    """排序截断 (fail-open: merged 可能为空).
+
+    Phase 3 (2026-08-14): 时间锚定检索 ——
+      - now 用 context_anchor.now_epoch() 统一时间锚
+      - 默认排除已失效事实 (memory.valid_to < now), 与 temporal_graph
+        "检索永远取当前值" 设计意图一致; 列不存在/迁移未跑/查询失败 → fail-open
+        不过滤 (不阻塞检索)。
+    """
     out = [v for v in merged.values() if v["score"] > 0]
+    if not out:
+        return []
+    try:
+        from v5.store import valid_to_map
+        from v5.context_anchor import now_epoch
+        ids = [str(v["id"]) for v in out]
+        vt = valid_to_map(ids, "memory", "id")
+        now = now_epoch()
+        out = [v for v in out
+               if vt.get(str(v["id"])) is None
+               or float(vt[str(v["id"])]) > now]
+    except Exception as exc:
+        logger.debug("_finish: temporal filter skipped (%s)", exc)
     out.sort(key=lambda x: -x["score"])
     return out[:tk]
+
+
+def retrieve_temporal(query: str, *, now: float | None = None,
+                      top_k: int = 5, **kw) -> list[dict]:
+    """时效感知检索: 包裹 retrieve, 过滤 valid_to 已失效(valid_to < now)的事实。
+
+    原位于 extensions.temporal_graph (2026-08-14 迁移至此以解开
+    temporal_graph ↔ memory_retrieval 循环依赖)。过期事实被直接剔除
+    (而非降权) —— 失效意味着"该值已被新事实取代", 召回它就是错误。
+    """
+    import time as _t
+    from v5.store import valid_to_map
+    now = _t.time() if now is None else now
+    results = retrieve(query, top_k=top_k, **kw)
+    if not results:
+        return results
+    ids = [str(r.get("id")) for r in results if r.get("id")]
+    vt = valid_to_map(ids, "memory", "id")
+    kept = [r for r in results
+            if vt.get(str(r.get("id"))) is None or vt[str(r.get("id"))] > now]
+    return kept
+
+
+# ─── 关键词兜底 (长句拆词重查) ─────────────────────────────────────
+# 复用 skill_store 的分词器 (ASCII 词原样 + 中文 2-gram, 支持中英混排),
+# 保证两处检索的拆词行为一致。
+
+
+def _keyword_tokens(query: str) -> list[str]:
+    try:
+        from v5.skill_store import _tokens
+        return _tokens(query)
+    except Exception:
+        return []
+
+
+def _keyword_fallback(
+    query: str,
+    result: list[dict],
+    tk: int,
+    min_weight: float,
+    character: str,
+) -> list[dict]:
+    """整句检索 miss 时, 把长 query 拆成关键词逐词 FTS 重查, 补足结果.
+
+    只补足 (append), 不改动已命中的排序; 每条兜底命中标记 source='kw'.
+    关键词命中是弱信号, score 用固定小值 (0.45, 略低于融合阈值 0.6 的
+    常见命中, 保证不喧宾夺主, 但能进 top_k)。
+    """
+    if len(result) >= tk:
+        return result
+    tokens = _keyword_tokens(query)
+    if len(tokens) < 2:
+        return result
+    try:
+        from v5 import store
+    except Exception:
+        return result
+
+    seen_ids = {str(r["id"]) for r in result}
+    # 稀有 token 优先: 常见词("哥哥"/"什么")LIKE 命中噪音多, 先查特异性 token
+    # (2026-08-10 实测: '文艺' 1 条命中 vs '哥哥' 50+ 条; 顺序错则金丝雀被挤掉)
+    try:
+        scored = []
+        for tok in tokens:
+            try:
+                n = store.count_like(tok, min_weight=min_weight, character=character)
+            except Exception:
+                n = 999
+            scored.append((n, tok))
+        scored.sort(key=lambda x: x[0])
+        ordered = [t for _, t in scored]
+    except Exception:
+        ordered = tokens
+    for tok in ordered:
+        if len(result) >= tk:
+            break
+        try:
+            # FTS5 unicode61 对中文 2-gram MATCH 无效(整串分词), 走 LIKE 子串
+            # 查询 (2026-08-10 实测: MATCH '主力' 0 命中 vs LIKE %主力% 命中)
+            hits = store.search_like(tok, top_k=3, min_weight=min_weight,
+                                     character=character)
+        except Exception as e:
+            logger.debug("keyword fallback failed for %r: %s", tok, e)
+            continue
+        for m in hits:
+            mid = str(m.id)
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            result.append({
+                "id": mid, "content": m.content, "type": m.type,
+                "weight": m.weight, "tags": getattr(m, "tags", ""),
+                "created": m.created,
+                "pad_p": getattr(m, "pad_p", 0.0),
+                "pad_a": getattr(m, "pad_a", 0.0),
+                "source": "kw",
+                "score": 0.45,
+                "access_count": int(getattr(m, "access_count", 0)),
+                "reinforcement": float(getattr(m, "reinforcement", 0.0)),
+                "last_accessed": float(getattr(m, "last_accessed", 0.0)),
+                "long_term": bool(getattr(m, "long_term", False)),
+            })
+    return result
 
 
 # ─── ThirdSpace Vault fallback ─────────────────────────────────────

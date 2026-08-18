@@ -21,22 +21,20 @@ logger = logging.getLogger("ikaros.memory.v5.llm")
 V4_ROOT = Path(__file__).resolve().parent
 V5_DATA_DIR = V4_ROOT / "data" / "v5"
 
-# 在路径定义完之后做 dotenv 加载 (按 HERMES_HOME → Ikaros 默认 → V4 顺序)
+# dotenv 加载: 只读项目根 .env (2026-08-18 收敛, 不再读 HERMES_HOME/.env)
+# 根 = 本文件位置推导 (core/v5/reflect/ → 项目根), 不写死盘符
 try:
     from dotenv import load_dotenv
-    _ikaros_root = os.environ.get("IKAROS_ROOT", r"E:\Ikaros")
-    _hermes_home_default = Path(_ikaros_root) / "data" / "hermes-agent"
-    _env_candidates = [
-        Path(os.environ.get("HERMES_HOME", _hermes_home_default)) / ".env",
-        _hermes_home_default / ".env",
-    ]
-    for _env in _env_candidates:
-        if _env.exists():
-            load_dotenv(_env, override=False)
-    # V4 自己的 .env 允许覆盖 (override=True, 优先级最高)
-    _v4_env = V4_ROOT / ".env"
-    if _v4_env.exists():
-        load_dotenv(_v4_env, override=True)
+    _ikaros_root = os.environ.get("IKAROS_ROOT", "")
+    if not _ikaros_root:
+        _ikaros_root = str(V4_ROOT.parent.parent.parent)  # core/v5/reflect → 项目根
+    _root_env = Path(_ikaros_root) / ".env"
+    if _root_env.exists():
+        load_dotenv(_root_env, override=False)
+    # V5 自己的 .env 允许覆盖 (override=True, 优先级最高)
+    _v5_env = V4_ROOT / ".env"
+    if _v5_env.exists():
+        load_dotenv(_v5_env, override=True)
 except ImportError:
     pass  # dotenv 不可用, 走 os.environ 裸读
 
@@ -160,7 +158,7 @@ def call_llm_auto(
             "Set via:\n"
             "  setx DEEPSEEK_API_KEY \"sk-...\"   (Windows)\n"
             "  export DEEPSEEK_API_KEY=\"sk-...\" (Linux/macOS/git-bash)\n"
-            "Or add to E:\\Ikaros\\data\\hermes-agent\\.env"
+            "Or add to the project root .env file"
         )
     return call_llm(system, user, provider="deepseek", max_tokens=max_tokens,
                     temperature=temperature, timeout=timeout)
@@ -184,7 +182,7 @@ def _call_deepseek(system: str, user: str, max_tokens: int,
             "DEEPSEEK_API_KEY not set. Set via:\n"
             "  setx DEEPSEEK_API_KEY \"sk-...\"   (Windows)\n"
             "  export DEEPSEEK_API_KEY=\"sk-...\" (Linux/macOS/git-bash)\n"
-            "Or add to E:\\Ikaros\\data\\hermes-agent\\.env"
+            "Or add to the project root .env file"
         )
 
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/v1/chat/completions"
@@ -250,7 +248,10 @@ def _ensure_local_llm_loaded() -> None:
     # 看门狗文件名含连字符, 用 wd_import 按路径加载 (不直接 import)
     import sys as _sys
     from pathlib import Path as _P
-    _bin = _P(os.environ.get("IKAROS_ROOT", r"E:\Ikaros")) / "bin"
+    _root = os.environ.get("IKAROS_ROOT", "")
+    if not _root:
+        _root = str(_P(__file__).resolve().parent.parent.parent)  # core/v5/reflect → 项目根
+    _bin = _P(_root) / "bin"
     if str(_bin) not in _sys.path:
         _sys.path.insert(0, str(_bin))
     from wd_import import ensure_local_llm

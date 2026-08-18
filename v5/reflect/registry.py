@@ -45,11 +45,75 @@ def make_consolidate_op() -> ReflectOp:
 
 
 def make_dedup_op() -> ReflectOp:
-    """去重: 6h, 小模型判断关系 (V3 兼容, V4 暂未单独实现, 用 v3 路径)."""
+    """算法去重 (无 LLM): 6h, 归档同类型高相似重复记忆, 保留最强一条.
+
+    2026-08-14 实现 (原空壳返 0): 复用 store._find_similar 的判重思路
+    (difflib ratio + 子串包含), 同类型内容高度相似 (ratio >= 0.92 或子串
+    包含) 时保留 weight 最高/created 最新的那条, 其余 archived=1 软删
+    (与 cleanup "归档不删除" 一致, 可恢复)。不调 LLM, 与决策 A 一致
+    (LLM 生成类反思已停用)。排除 conversation (天然相似易误伤)、
+    identity/axiom/rule (灵魂核心) 与 v5_key: 结构化记录。
+    """
+    DEDUP_THRESHOLD = 0.92
+    DEDUP_MAX_SCAN = 2000
+
     def _fn() -> int:
-        # V4 暂未独立实现 dedup, 直接返 0 (待 Phase 3.5)
-        logger.debug("dedup: V4 待实现, 跳过")
-        return 0
+        from v5 import store
+        import difflib
+        import time as _time
+        now = _time.time()
+        try:
+            with store.conn() as c:
+                rows = c.execute(
+                    "SELECT id, content, type FROM memory "
+                    "WHERE archived = 0 "
+                    "AND type NOT IN ('conversation','identity','axiom','rule') "
+                    "AND (tags IS NULL OR tags NOT LIKE '%v5_key:%') "
+                    "ORDER BY type, weight DESC, created DESC LIMIT ?",
+                    (DEDUP_MAX_SCAN,),
+                ).fetchall()
+        except Exception as exc:
+            logger.debug("dedup: scan failed (%s)", exc)
+            return 0
+
+        dup_ids: list[int] = []
+        groups: dict[str, list] = {}
+        for r in rows:
+            groups.setdefault(r["type"], []).append(r)
+        for _typ, items in groups.items():
+            keepers: list[tuple[str, int]] = []  # (规范化 content, id)
+            for r in items:
+                content = " ".join((r["content"] or "").split())
+                is_dup = False
+                for kc, _kid in keepers:
+                    try:
+                        ratio = difflib.SequenceMatcher(None, kc, content).ratio()
+                    except Exception:
+                        ratio = 0.0
+                    if (ratio >= DEDUP_THRESHOLD
+                            or (len(kc) >= 8 and kc in content)
+                            or (len(content) >= 8 and content in kc)):
+                        is_dup = True
+                        break
+                if is_dup:
+                    dup_ids.append(r["id"])
+                else:
+                    keepers.append((content, r["id"]))
+
+        if dup_ids:
+            try:
+                with store.conn() as c:
+                    c.executemany(
+                        "UPDATE memory SET archived = 1, archived_at = ? WHERE id = ?",
+                        [(now, i) for i in dup_ids],
+                    )
+                    c.commit()
+            except Exception as exc:
+                logger.debug("dedup: archive failed (%s)", exc)
+                return 0
+        if dup_ids:
+            logger.info("dedup: archived %d duplicate memories", len(dup_ids))
+        return len(dup_ids)
 
     return ReflectOp(
         name="dedup",
@@ -246,9 +310,14 @@ def make_memory_promote_op() -> ReflectOp:
             with store.conn() as c:
                 # 先回收: long_term=1 且 90 天零访问 → 降回 short_term
                 # (必须放在晋升前: 同一事务内刚晋升的行若 last_accessed=0 会立即被回收)
+                # 2026-08-14 修复: 原条件 `access_count=0 AND (last_accessed=0 OR ...)`
+                # 会把从未被访问的历史合并行 (last_accessed=0) 无条件降级,
+                # 与 promote_op 打架——promote 901 条 → memory_promote 立刻回收 901 条,
+                # 全部卡在 short=0/long=0。只回收"有访问史但 90 天未访问"的行。
                 cur2 = c.execute(
                     "UPDATE memory SET long_term = 0 WHERE long_term = 1 AND "
-                    "  access_count = 0 AND (last_accessed = 0 OR ? - last_accessed > 90 * 86400)",
+                    "  access_count = 0 AND last_accessed > 0 "
+                    "  AND (? - last_accessed > 90 * 86400)",
                     (now,),
                 )
                 demoted = getattr(cur2, "rowcount", 0) or 0
@@ -286,6 +355,7 @@ def make_temporal_extract_op() -> ReflectOp:
     def _fn() -> int:
         from v5 import store
         import re as _re
+        import time  # 2026-08-14: 缺 import, op 一直 NameError 静默失败
         now = time.time()
         try:
             with store.conn() as c:
@@ -354,25 +424,51 @@ def make_temporal_extract_op() -> ReflectOp:
     )
 
 
+def make_retention_op() -> ReflectOp:
+    """统一记忆生命周期 (mnemon EI 借鉴): 6h, demote/promote/archive 单轮.
+
+    2026-08-14 落地 (推荐 5): 取代分散的 promote / cleanup / memory_promote
+    三个 op, 用单一 EI 公式 + retention_pass 一轮批写, 消除阈值打架。
+    """
+    RETENTION_INTERVAL = 6 * 3600  # 6h
+
+    def _fn() -> int:
+        from v5.lifecycle import retention_pass
+        r = retention_pass()
+        return r["promoted"] + r["demoted"] + r["archived"]
+
+    return ReflectOp(
+        name="retention",
+        fn=_fn,
+        interval_sec=RETENTION_INTERVAL,
+        last_run_key="last_retention",
+    )
+
+
 # ─── 默认 scheduler (V5.2) ─────────────────────────────────
 
 def make_default_scheduler(state: ScheduleState | None = None) -> ReflectScheduler:
-    """构造 V5.2 scheduler, 包含所有原始 op + V5.2 新增 op."""
+    """构造 V5.2 scheduler.
+
+    2026-08-14 决策 A（用户拍板：反思管线 LLM 生成类没用）：
+    - 停用 5 个 LLM 生成 op：consolidate / distill / reflect / narrative / self_discovery
+      —— 无去重（dedup 从未实现）产生 579 条雷同 user_trait、哲学味叙事、
+      思维链泄漏的 emotional_event，且白烧云端 API。op 工厂函数保留，
+      需要时可手动调用 consolidate_conversations() / distill() / reflect()。
+    - 保留算法类 op：retention（统一生命周期，取代 promote/cleanup/memory_promote）/
+      dedup / vector_sync / temporal_extract / reflection_promote / expire_directives
+      （记忆生命周期基础设施，与 LLM 生成无关）。
+    """
     s = ReflectScheduler(state=state)
-    s.register(make_consolidate_op())
-    s.register(make_dedup_op())
-    s.register(make_promote_op())
-    s.register(make_distill_op())
-    s.register(make_reflect_op())
-    s.register(make_cleanup_op())
+    s.register(make_dedup_op())          # 算法去重 (2026-08-14 已实现)
+    # V5.7 (2026-08-14): 统一生命周期 retention 取代 promote/cleanup/memory_promote
+    # (三者阈值打架, 见 AGENTS.md; 旧工厂函数保留, 默认调度器只用 retention)
+    s.register(make_retention_op())
     s.register(make_vector_sync_op())
-    s.register(make_narrative_op())
-    s.register(make_self_discovery_op())
     # V5.2 新增
     s.register(make_reflection_promote_op())
     s.register(make_expire_directives_op())
-    # 阶段 2/5 新增: 记忆两档桥接 + 时间戳抽取
-    s.register(make_memory_promote_op())
+    # 阶段 5 新增: 时间戳抽取
     s.register(make_temporal_extract_op())
     return s
 

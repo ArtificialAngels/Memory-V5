@@ -11,8 +11,8 @@ import sys
 import time
 from pathlib import Path
 
-V5_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(V5_ROOT))
+V5_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(V5_ROOT.parent))
 
 from v5.tools.memory_tool import (
     v5_memory_delete,
@@ -28,7 +28,8 @@ _MARK = f"__v5test_memory_{int(time.time())}__"
 def _parse(fn, *args, **kwargs):
     out = fn(*args, **kwargs)
     assert isinstance(out, str), "every tool must return a JSON string"
-    return json.loads(out)
+    # answer() is NL-first: human text + JSON appendix on the last line.
+    return json.loads(out.splitlines()[-1])
 
 
 def test_store_returns_id():

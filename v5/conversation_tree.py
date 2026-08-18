@@ -67,6 +67,30 @@ def _extract_summary(messages: List[Dict[str, Any]], max_chars: int = 80) -> str
     return ""
 
 
+def _ensure_message_ids(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """给消息补稳定 id (2026-08-15 poker 对齐).
+
+    分支点 / 发散点用消息 id 定位 (parallel_source_message_id / branching_source_message_id)。
+    已带 id 的保持不变; 缺失 (历史消息) 补 msg_<ts>_<rand>。返回新列表, 不修改入参。
+    """
+    out: List[Dict[str, Any]] = []
+    for m in messages or []:
+        m2 = dict(m)
+        if not m2.get("id"):
+            m2["id"] = uid("msg")
+        out.append(m2)
+    return out
+
+
+def _strip_msg_ids(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """剥离消息 id 字段 (LLM 上下文用).
+
+    OpenAI 兼容 API 对 messages 中的未知字段可能严格报 400, 故上下文输出不携带 id。
+    前端定位 (分支点/发散点) 用 state 内联 messages 的 id, 不走上下文路径。
+    """
+    return [{k: v for k, v in m.items() if k != "id"} for m in messages]
+
+
 # ───────────────────────────── v2 新实体 ─────────────────────────────
 
 @dataclass
@@ -217,7 +241,7 @@ class ConvNode:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ConvNode":
-        return cls(
+        node = cls(
             id=d["id"],
             parent_id=d.get("parent_id"),
             children=list(d.get("children", [])),
@@ -246,6 +270,116 @@ class ConvNode:
             exec_state=d.get("exec_state", "idle"),
             exec_progress=d.get("exec_progress", 0.0),
             exec_detail=d.get("exec_detail", ""),
+        )
+        # 整包导入: 序列化节点可能内联 messages (对话本体)。拓扑 JSON 只存指针,
+        # 故此处仅作**迁移暂存** (from_dict 后由 _migrate_tree 写入 V5 store),
+        # 不参与 to_dict/persist 序列化, 保证拓扑文件保持精简。
+        # (旧代码直接丢弃 messages → import 后消息历史丢失, 导出-导入无法闭环)
+        msgs = d.get("messages")
+        if msgs is not None:
+            node.messages = msgs
+        return node
+
+
+# ───────────────────────────── 卡片 (poker 对齐, 2026-08-15) ─────────────────────────────
+# 数据层对齐 ai.explore.poker: **卡片 = 一段多轮会话** (messages 数组), 不是单回合。
+# 底层仍保留 node=回合 为事实源 (V5 store 记忆 / supervisor / 上下文构建零改动),
+# 卡片由节点链按"分叉点切分"自动聚合; 手动建卡(子/发散/分支卡)与分支点/未读经
+# cards_meta 持久化合并进自动卡。
+
+@dataclass
+class ConvCard:
+    """卡片: 一段多轮会话 (对齐 ai.explore.poker 的 Card).
+
+    - 自动聚合: 卡片头 = ROOT + 每个分叉点(≥2 子节点)的每个孩子;
+      卡片 = 从卡片头向下收连续子链, 到下一个卡片头为止。
+      messages = 链上所有节点的消息串联 (一段连续对话)。
+    - 手动建卡: fork 出的新节点天然成为卡片头; parallel/branching 来源标记、
+      分支点 (来源消息 id)、标题、未读经 cards_meta 持久化后合并。
+    """
+    id: str                                       # "card_" + 卡片头节点 id (稳定可反查)
+    title: str = ""                               # 无标题卡片 / 头节点 meta.title
+    messages: List[Dict[str, Any]] = field(default_factory=list)   # 一段多轮会话
+    parent_id: Optional[str] = None               # 父卡 id (卡片头 parent 所在卡)
+    children: List[str] = field(default_factory=list)              # 子卡 id 列表
+    depth: int = 0
+    # → 发散卡: 从来源卡某条消息发散 (关联主题)
+    parallel_source_id: Optional[str] = None
+    parallel_source_message_id: Optional[str] = None
+    # ↓ 分支卡: 从来源卡某条消息 (分支点) 开始的分支
+    branching_source_id: Optional[str] = None
+    branching_source_message_id: Optional[str] = None
+    source_focus: str = ""                        # 触发建卡的选中文本
+    is_unread: bool = False
+    node_ids: List[str] = field(default_factory=list)     # 组成卡片的底层节点
+    v5_memory_ids: List[int] = field(default_factory=list)
+    summary: str = ""
+    agent: str = "ikaros"
+    branch_label: Optional[str] = None
+    created_at: float = 0.0
+    is_valid: bool = True
+    kind: str = "auto"                            # auto | child | parallel | branching | manual
+    parent_override: Optional[str] = None         # (旧模型保留兼容) 手动指定父卡
+    # 2026-08-16 (显式连接图重构): 卡片独立存在, 关系 = 显式 links (多对多, 可断开)。
+    # inputs  = 本卡接收的结论 (左/上锚点): [{id, from_card, from_port, to_port, kind}]
+    # outputs = 本卡输出的结论 (右/下锚点): [{id, to_card, to_port, from_port, kind}]
+    inputs: List[Dict[str, Any]] = field(default_factory=list)
+    outputs: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "messages": self.messages,
+            "parent_id": self.parent_id,
+            "children": list(self.children),
+            "depth": self.depth,
+            "parallel_source_id": self.parallel_source_id,
+            "parallel_source_message_id": self.parallel_source_message_id,
+            "branching_source_id": self.branching_source_id,
+            "branching_source_message_id": self.branching_source_message_id,
+            "source_focus": self.source_focus,
+            "is_unread": self.is_unread,
+            "node_ids": list(self.node_ids),
+            "v5_memory_ids": list(self.v5_memory_ids),
+            "summary": self.summary,
+            "agent": self.agent,
+            "branch_label": self.branch_label,
+            "created_at": self.created_at,
+            "is_valid": self.is_valid,
+            "kind": self.kind,
+            "parent_override": self.parent_override,
+            # 2026-08-16 (显式连接图): 入/出连接 (前端锚点连线直接消费)
+            "inputs": list(self.inputs),
+            "outputs": list(self.outputs),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ConvCard":
+        return cls(
+            id=d["id"],
+            title=d.get("title", ""),
+            messages=list(d.get("messages", [])),
+            parent_id=d.get("parent_id"),
+            children=list(d.get("children", [])),
+            depth=d.get("depth", 0),
+            parallel_source_id=d.get("parallel_source_id"),
+            parallel_source_message_id=d.get("parallel_source_message_id"),
+            branching_source_id=d.get("branching_source_id"),
+            branching_source_message_id=d.get("branching_source_message_id"),
+            source_focus=d.get("source_focus", ""),
+            is_unread=bool(d.get("is_unread", False)),
+            node_ids=list(d.get("node_ids", [])),
+            v5_memory_ids=list(d.get("v5_memory_ids", [])),
+            summary=d.get("summary", ""),
+            agent=d.get("agent", "ikaros"),
+            branch_label=d.get("branch_label"),
+            created_at=d.get("created_at", 0.0),
+            is_valid=d.get("is_valid", True),
+            kind=d.get("kind", "auto"),
+            parent_override=d.get("parent_override"),
+            inputs=list(d.get("inputs", [])),
+            outputs=list(d.get("outputs", [])),
         )
 
 
@@ -343,6 +477,15 @@ class ConversationTree:
         self.trunk_id: Optional[str] = None
         self.version: int = 0
         self.persist_key = persist_key
+        # 2026-08-15 (poker 对齐): 手动卡片元数据 —— card_id -> {kind, source_card_id,
+        # source_message_id, source_focus, title, is_unread}。自动聚合卡无需登记,
+        # 仅手动建卡(子/发散/分支卡)的附加标记与未读状态落盘 (重启不丢)。
+        self.cards_meta: Dict[str, Dict[str, Any]] = {}
+        # 2026-08-16 (显式连接图重构): 卡片独立存在, 关系 = 显式 links (多对多, 可断开)。
+        # links 元素: {id, from_card, from_port(right|bottom), to_card, to_port(left|top), kind}
+        #   from 出 → to 入; kind: auto(旧关系迁移) | manual(手连) | branching | parallel | child
+        self.links: List[Dict[str, Any]] = []
+        self._links_pending_migration: bool = False   # 旧 JSON 无 links → build_cards 首次迁移
         self.data_dir = Path(data_dir) if data_dir else V5_DATA_DIR
         self.onChange = onChange
         self._lock = threading.RLock()
@@ -425,8 +568,9 @@ class ConversationTree:
             mid = 0
             root_id = uid("root")
             if seed_messages:
-                content = json.dumps(seed_messages, ensure_ascii=False)
-                sm = seed_summary or _extract_summary(seed_messages)
+                seed_msgs = _ensure_message_ids(seed_messages)
+                content = json.dumps(seed_msgs, ensure_ascii=False)
+                sm = seed_summary or _extract_summary(seed_msgs)
                 mid = self._store_fn(content, type="conversation",
                                      tags=f"{_tree_tag(root_id)} session:{self.persist_key}")
             else:
@@ -485,7 +629,7 @@ class ConversationTree:
                     try:
                         msgs = json.loads(raw)
                         if isinstance(msgs, list):
-                            ctx.extend(msgs)
+                            ctx.extend(_strip_msg_ids(msgs))   # LLM 上下文: 剥离 id (OpenAI 兼容 API 严格字段)
                     except json.JSONDecodeError:
                         ctx.append({"role": "system", "content": raw})
             return ctx
@@ -513,7 +657,7 @@ class ConversationTree:
                     "branch_label": n.branch_label,
                     "v5_memory_id": n.v5_memory_id,
                     "summary": n.summary,
-                    "messages": msgs,
+                    "messages": _strip_msg_ids(msgs),   # 树感知压缩输出: 剥离 id
                 })
             return result
 
@@ -547,7 +691,7 @@ class ConversationTree:
                     try:
                         parsed = json.loads(raw)
                         if isinstance(parsed, list):
-                            messages.extend(parsed)
+                            messages.extend(_strip_msg_ids(parsed))   # LLM 上下文: 剥离 id
                     except json.JSONDecodeError:
                         pass
         messages = messages[-max_messages:]
@@ -629,8 +773,9 @@ class ConversationTree:
 
             # 存储对话内容到 V5 store (带 node/branch/session 树域标签, 供 tree_scoped_retrieve
             # 做会话隔离过滤 —— session:<persist_key> 保证多会话记忆不串台, H1 修复)
-            content = json.dumps(messages, ensure_ascii=False)
-            sm = _extract_summary(messages)
+            msgs = _ensure_message_ids(messages)
+            content = json.dumps(msgs, ensure_ascii=False)
+            sm = _extract_summary(msgs)
             node_id = uid("n")
             new_tags = f"{tags} {_tree_tag(node_id, branch_label)} session:{self.persist_key}".strip()
             mid = self._store_fn(content, type="conversation", tags=new_tags)
@@ -765,41 +910,43 @@ class ConversationTree:
         与 add_turn 的区别: fork_branch 显式标记 node_type="branch",
         用于分支管理场景。add_turn 保持 node_type 继承父节点。
         """
-        fork_node = self.nodes.get(fork_point_id)
-        if not fork_node:
-            raise ValueError(f"fork point not found: {fork_point_id}")
+        with self._lock:
+            fork_node = self.nodes.get(fork_point_id)
+            if not fork_node:
+                raise ValueError(f"fork point not found: {fork_point_id}")
 
-        content = json.dumps(messages, ensure_ascii=False)
-        sm = _extract_summary(messages)
-        node_id = uid("br")
-        new_tags = f"{tags} {_tree_tag(node_id, branch_label)} session:{self.persist_key}".strip()
-        mid = self._store_fn(content, type="conversation", tags=new_tags)
-        if mid == 0:
-            # F5: store 失败 (返回 0) 时显式告警, 不再无声丢内容
-            logger.warning("fork_branch: V5 store failed for node %s (content not persisted)", node_id)
+            msgs = _ensure_message_ids(messages)
+            content = json.dumps(msgs, ensure_ascii=False)
+            sm = _extract_summary(msgs)
+            node_id = uid("br")
+            new_tags = f"{tags} {_tree_tag(node_id, branch_label)} session:{self.persist_key}".strip()
+            mid = self._store_fn(content, type="conversation", tags=new_tags)
+            if mid == 0:
+                # F5: store 失败 (返回 0) 时显式告警, 不再无声丢内容
+                logger.warning("fork_branch: V5 store failed for node %s (content not persisted)", node_id)
 
-        node = ConvNode(
-            id=node_id,
-            parent_id=fork_point_id,
-            agent=fork_node.agent,
-            depth=fork_node.depth + 1,
-            branch_label=branch_label,
-            node_type="branch",
-            v5_memory_id=mid,
-            summary=sm,
-            state=_clone(state) if state is not None else _clone(fork_node.state),
-            config=_clone(config) if config is not None else _clone(fork_node.config),
-            meta={"created_at": time.time(), "title": title},
-            thinking=thinking,
-            tool_calls=list(tool_calls) if tool_calls else [],
-            usage=usage or {},
-            skills_used=list(skills_used) if skills_used else [],
-            created_at=time.time(),
-        )
-        self.nodes[node.id] = node
-        fork_node.children.append(node.id)
-        self.current_id = node.id
-        self.version += 1
+            node = ConvNode(
+                id=node_id,
+                parent_id=fork_point_id,
+                agent=fork_node.agent,
+                depth=fork_node.depth + 1,
+                branch_label=branch_label,
+                node_type="branch",
+                v5_memory_id=mid,
+                summary=sm,
+                state=_clone(state) if state is not None else _clone(fork_node.state),
+                config=_clone(config) if config is not None else _clone(fork_node.config),
+                meta={"created_at": time.time(), "title": title},
+                thinking=thinking,
+                tool_calls=list(tool_calls) if tool_calls else [],
+                usage=usage or {},
+                skills_used=list(skills_used) if skills_used else [],
+                created_at=time.time(),
+            )
+            self.nodes[node.id] = node
+            fork_node.children.append(node.id)
+            self.current_id = node.id
+            self.version += 1
         self._emit()
         self.persist()
         return node
@@ -811,27 +958,28 @@ class ConversationTree:
         conclusions: List[str],
     ) -> ConvNode:
         """将分支节点标记为已结论化。"""
-        node = self.nodes.get(node_id)
-        if not node:
-            raise ValueError(f"node not found: {node_id}")
-        node.node_type = "conclusion"
-        # S1: 主线终点被收尾 → 回退到最近的 trunk 祖先 (conclusion 不再延续主线)
-        if self.trunk_id == node_id:
-            anc = self.nodes.get(node.parent_id) if node.parent_id else None
-            self.trunk_id = None
-            while anc:
-                if anc.node_type == "trunk" and anc.id != self.root_id:
-                    self.trunk_id = anc.id
-                    break
-                anc = self.nodes.get(anc.parent_id) if anc.parent_id else None
-        for text in conclusions:
-            node.conclusions.append(NodeInsight(
-                text=text,
-                confidence=0.8,
-                source_ids=[node_id],
-                extracted_at=time.time(),
-            ))
-        self.version += 1
+        with self._lock:
+            node = self.nodes.get(node_id)
+            if not node:
+                raise ValueError(f"node not found: {node_id}")
+            node.node_type = "conclusion"
+            # S1: 主线终点被收尾 → 回退到最近的 trunk 祖先 (conclusion 不再延续主线)
+            if self.trunk_id == node_id:
+                anc = self.nodes.get(node.parent_id) if node.parent_id else None
+                self.trunk_id = None
+                while anc:
+                    if anc.node_type == "trunk" and anc.id != self.root_id:
+                        self.trunk_id = anc.id
+                        break
+                    anc = self.nodes.get(anc.parent_id) if anc.parent_id else None
+            for text in conclusions:
+                node.conclusions.append(NodeInsight(
+                    text=text,
+                    confidence=0.8,
+                    source_ids=[node_id],
+                    extracted_at=time.time(),
+                ))
+            self.version += 1
         self._emit()
         self.persist()
         return node
@@ -848,76 +996,79 @@ class ConversationTree:
         trunk.merged_from += branch_node_id。
         分支结论注入主干时 confidence × 0.9 并标记来源。
         """
-        branch = self.nodes.get(branch_node_id)
-        trunk = self.nodes.get(trunk_target_id)
-        if not branch:
-            raise ValueError(f"branch node not found: {branch_node_id}")
-        if not trunk:
-            raise ValueError(f"trunk node not found: {trunk_target_id}")
-        if trunk.node_type != "trunk":
-            raise ValueError(f"merge target must be trunk, got: {trunk.node_type}")
+        with self._lock:
+            branch = self.nodes.get(branch_node_id)
+            trunk = self.nodes.get(trunk_target_id)
+            if not branch:
+                raise ValueError(f"branch node not found: {branch_node_id}")
+            if not trunk:
+                raise ValueError(f"trunk node not found: {trunk_target_id}")
+            if trunk.node_type != "trunk":
+                raise ValueError(f"merge target must be trunk, got: {trunk.node_type}")
 
-        # 1. 建立 merge 边
-        branch.merge_target = trunk_target_id
-        if branch_node_id not in trunk.merged_from:
-            trunk.merged_from.append(branch_node_id)
+            # 1. 建立 merge 边
+            branch.merge_target = trunk_target_id
+            if branch_node_id not in trunk.merged_from:
+                trunk.merged_from.append(branch_node_id)
 
-        # 2. 注入结论（confidence × 0.9）
-        for insight in branch.conclusions:
-            trunk.conclusions.append(NodeInsight(
-                text=f"[merged from {branch.branch_label}] {insight.text}",
-                confidence=insight.confidence * 0.9,
-                source_ids=list(insight.source_ids) + [branch_node_id],
-                extracted_at=time.time(),
-            ))
+            # 2. 注入结论（confidence × 0.9）
+            for insight in branch.conclusions:
+                trunk.conclusions.append(NodeInsight(
+                    text=f"[merged from {branch.branch_label}] {insight.text}",
+                    confidence=insight.confidence * 0.9,
+                    source_ids=list(insight.source_ids) + [branch_node_id],
+                    extracted_at=time.time(),
+                ))
 
-        # 3. 更新主干 state
-        trunk.state.setdefault("merged_insights", [])
-        trunk.state["merged_insights"].append({
-            "branch_id": branch_node_id,
-            "branch_label": branch.branch_label,
-            "conclusions": [i.text for i in branch.conclusions],
-            "merged_at": time.time(),
-        })
+            # 3. 更新主干 state
+            trunk.state.setdefault("merged_insights", [])
+            trunk.state["merged_insights"].append({
+                "branch_id": branch_node_id,
+                "branch_label": branch.branch_label,
+                "conclusions": [i.text for i in branch.conclusions],
+                "merged_at": time.time(),
+            })
 
-        self.version += 1
+            self.version += 1
         self._emit()
         self.persist()
 
     # ── v2: 撤销合并 ──
     def unmerge_branch(self, branch_node_id: str) -> None:
         """撤销分支合并: 断开 merge 边, 从主干移除注入的结论."""
-        branch = self.nodes.get(branch_node_id)
-        if not branch or not branch.merge_target:
-            return
-        trunk = self.nodes.get(branch.merge_target)
-        if trunk:
-            if branch_node_id in trunk.merged_from:
-                trunk.merged_from.remove(branch_node_id)
-            trunk.conclusions = [
-                c for c in trunk.conclusions
-                if branch_node_id not in c.source_ids
-            ]
-            if "merged_insights" in trunk.state:
-                trunk.state["merged_insights"] = [
-                    m for m in trunk.state["merged_insights"]
-                    if m.get("branch_id") != branch_node_id
+        with self._lock:
+            branch = self.nodes.get(branch_node_id)
+            if not branch or not branch.merge_target:
+                return
+            trunk = self.nodes.get(branch.merge_target)
+            if trunk:
+                if branch_node_id in trunk.merged_from:
+                    trunk.merged_from.remove(branch_node_id)
+                trunk.conclusions = [
+                    c for c in trunk.conclusions
+                    if branch_node_id not in c.source_ids
                 ]
-        branch.merge_target = None
-        self.version += 1
+                if "merged_insights" in trunk.state:
+                    trunk.state["merged_insights"] = [
+                        m for m in trunk.state["merged_insights"]
+                        if m.get("branch_id") != branch_node_id
+                    ]
+            branch.merge_target = None
+            self.version += 1
         self._emit()
         self.persist()
 
     # ── v2: 废弃分支 ──
     def abandon_branch(self, node_id: str) -> None:
         """废弃分支: 子树全部标记 is_valid=False, 不移除节点."""
-        node = self.nodes.get(node_id)
-        if not node:
-            raise ValueError(f"node not found: {node_id}")
-        for n in self.subtree(node_id):
-            n.is_valid = False
-            n.meta["abandoned_at"] = time.time()
-        self.version += 1
+        with self._lock:
+            node = self.nodes.get(node_id)
+            if not node:
+                raise ValueError(f"node not found: {node_id}")
+            for n in self.subtree(node_id):
+                n.is_valid = False
+                n.meta["abandoned_at"] = time.time()
+            self.version += 1
         self._emit()
         self.persist()
 
@@ -1032,6 +1183,8 @@ class ConversationTree:
             # F2: 清理其它节点对已删节点的 merge 引用 (merged_from/merge_target/
             # merged_insights/conclusions.source_ids), 避免 unmerge 静默失效 + 数据残留
             self._cleanup_merge_refs(del_ids)
+            # 2026-08-15 (poker 对齐): 清理被删节点为头的卡片元数据 (防残留脏键)
+            self._cleanup_cards_meta(del_ids)
             # S1: 主线终点被删 → 重指最近的 trunk 祖先 (或根), 保持主线语义
             if self.trunk_id in del_ids:
                 self.trunk_id = None
@@ -1075,6 +1228,15 @@ class ConversationTree:
                 c for c in other.conclusions
                 if not (deleted_ids & set(c.source_ids) and c.text.startswith("[merged from"))
             ]
+
+    def _cleanup_cards_meta(self, deleted_ids: "set[str]") -> None:
+        """删除节点后清理以该节点为头的卡片元数据 (需已持有 _lock)."""
+        if not deleted_ids or not self.cards_meta:
+            return
+        gone = {f"card_{nid}" for nid in deleted_ids}
+        for cid in list(self.cards_meta):
+            if cid in gone:
+                self.cards_meta.pop(cid, None)
 
     # ── v2.2: 设置节点代理归属 (ekko-agent 模式) ──
     def set_agent(self, node_id: str, agent: str, cascade: bool = False) -> "ConvNode":
@@ -1161,6 +1323,8 @@ class ConversationTree:
             self.nodes.pop(node_id, None)
             # F2: 清理其它节点对已删节点的 merge 引用
             self._cleanup_merge_refs({node_id})
+            # 2026-08-15 (poker 对齐): 清理被删节点为头的卡片元数据
+            self._cleanup_cards_meta({node_id})
             # S1: 主线终点被删 → 重指父节点 (保持主线语义)
             if self.trunk_id == node_id:
                 self.trunk_id = parent.id if parent and parent.id != self.root_id else None
@@ -1229,6 +1393,512 @@ class ConversationTree:
         with self._lock:
             yield self
 
+    # ── 卡片视图 (2026-08-15: 数据层对齐 poker; 底层节点=回合 保留为事实源) ──
+    def _card_heads(self) -> set:
+        """卡片头集合 (2026-08-16 主线聚合修复): ROOT + 分支起点.
+
+        旧规则 (分叉点孩子 = 卡头) 会把分叉点自身孤立成单回合薄卡 —— 真实树
+        分叉密集时画布退化成"每回合一张卡", 与"一段会话一张卡"的目标相悖。
+        新规则: 主线 (trunk 路径) **连续聚合不切分**, 主线整条 = 一张卡;
+        仅"从分叉点岔出去的分支起点" (父是分叉点且不在主线路径) 成为新卡头。
+        trunk_id 缺失时沿"首个子节点链"推断主线 (首条对话路径)。
+        """
+        heads: set = set()
+        if self.root_id is not None:
+            heads.add(self.root_id)
+        # 主线终点: trunk_id 优先; 缺失时沿首个子节点链下探 (首条路径作主线)
+        trunk_end: Optional[str] = self.trunk_id
+        if trunk_end is None and self.root_id is not None:
+            n = self.nodes.get(self.root_id)
+            while n:
+                trunk_end = n.id
+                first = next((c for c in n.children if c in self.nodes), None)
+                n = self.nodes.get(first) if first else None
+        # 主线路径 = trunk_end 及其祖先链 (沿 parent 可达 trunk_end 的节点)
+        trunk_path: set = set()
+        cur = trunk_end
+        guard = 0
+        while cur and guard < 512:
+            if cur in trunk_path:
+                break
+            trunk_path.add(cur)
+            p = self.nodes.get(cur)
+            cur = p.parent_id if p else None
+            guard += 1
+        for n in self.nodes.values():
+            parent = self.nodes.get(n.parent_id) if n.parent_id else None
+            if not parent:
+                continue
+            kids = [c for c in parent.children if c in self.nodes]
+            if len(kids) >= 2 and n.id not in trunk_path:
+                heads.add(n.id)          # 分支起点 (非主线延续) → 新卡头
+        return heads
+
+    def _collect_card(self, head_id: str, heads: set) -> "ConvCard":
+        """从卡片头向下收连续子链, 遇到下一个卡片头停止 → 一张卡片."""
+        node_ids: List[str] = []
+        v5_ids: List[int] = []
+        child_card_ids: List[str] = []
+        summary = ""
+        agent = "ikaros"
+        branch_label: Optional[str] = None
+        created_at = 0.0
+        is_valid = True
+        max_depth = 0
+        stack = [head_id]
+        while stack:
+            nid = stack.pop()
+            n = self.nodes.get(nid)
+            if not n:
+                continue
+            node_ids.append(nid)
+            if n.v5_memory_id > 0:
+                v5_ids.append(n.v5_memory_id)
+            if not summary and n.summary:
+                summary = n.summary
+            agent = n.agent or agent
+            if n.branch_label:
+                branch_label = n.branch_label
+            if n.created_at and (not created_at or n.created_at < created_at):
+                created_at = n.created_at
+            if not n.is_valid:
+                is_valid = False
+            max_depth = max(max_depth, n.depth)
+            for c in n.children:
+                if c not in self.nodes:
+                    continue
+                if c in heads:
+                    child_card_ids.append("card_" + c)
+                else:
+                    stack.append(c)
+        # 节点按 (深度, 创建序) 排列, 保证消息串联顺序稳定 (头在前)
+        node_ids.sort(key=lambda nid: (
+            self.nodes[nid].depth if nid in self.nodes else 0,
+            self.nodes[nid].created_at if nid in self.nodes else 0,
+        ))
+        head = self.nodes.get(head_id)
+        return ConvCard(
+            id="card_" + head_id,
+            parent_id=None,
+            children=child_card_ids,
+            depth=head.depth if head else 0,
+            node_ids=node_ids,
+            v5_memory_ids=v5_ids,
+            summary=summary,
+            agent=agent,
+            branch_label=branch_label,
+            created_at=created_at,
+            is_valid=is_valid,
+        )
+
+    def build_cards(self, load_messages: bool = True) -> List["ConvCard"]:
+        """构建卡片视图 (自动聚合 + cards_meta 手动覆盖合并).
+
+        每张卡 = 一段连续会话; messages 从 V5 store 批量回读串联
+        (load_messages=False 时跳过回读, 供轻量拓扑请求)。
+        cards_meta 中手动建卡标记 (kind/source/title/is_unread) 合并到自动卡。
+        """
+        with self._lock:
+            heads = self._card_heads()
+            cards: List[ConvCard] = []
+            for hid in heads:
+                card = self._collect_card(hid, heads)
+                meta = (self.cards_meta or {}).get(card.id, {})
+                if meta:
+                    card.kind = meta.get("kind", card.kind)
+                    card.parallel_source_id = meta.get("parallel_source_id") or card.parallel_source_id
+                    card.parallel_source_message_id = meta.get("parallel_source_message_id") or card.parallel_source_message_id
+                    card.branching_source_id = meta.get("branching_source_id") or card.branching_source_id
+                    card.branching_source_message_id = meta.get("branching_source_message_id") or card.branching_source_message_id
+                    card.source_focus = meta.get("source_focus", card.source_focus)
+                    if "is_unread" in meta:
+                        card.is_unread = bool(meta["is_unread"])
+                    if meta.get("title"):
+                        card.title = meta["title"]
+                # 标题 fallback: cards_meta.title → 头节点 meta.title → summary → 无标题卡片
+                if not card.title:
+                    head = self.nodes.get(hid)
+                    if head and head.meta.get("title"):
+                        card.title = head.meta["title"]
+                    elif card.summary:
+                        card.title = (card.summary or "")[:24]
+                    else:
+                        card.title = "无标题卡片"
+                cards.append(card)
+            # 卡片父链: 手动 parent_override 优先 (科技树编排), 否则卡片头 parent 所在卡 (自动派生)
+            node2card: Dict[str, str] = {}
+            for c in cards:
+                for nid in c.node_ids:
+                    node2card[nid] = c.id
+            card_ids = {c.id for c in cards}
+            for c in cards:
+                meta2 = (self.cards_meta or {}).get(c.id, {})
+                if "parent_override" in meta2:
+                    ov = meta2.get("parent_override")
+                    c.parent_override = ov
+                    c.parent_id = ov if ov and ov in card_ids else None   # 目标卡不存在/空 → 无父 (根)
+                else:
+                    hid = c.id[len("card_"):]
+                    head = self.nodes.get(hid)
+                    c.parent_id = node2card.get(head.parent_id) if head and head.parent_id else None
+            # children 重算 (基于最终 parent; 手动重排后自动跟随)
+            for c in cards:
+                c.children = []
+            for c in cards:
+                if c.parent_id:
+                    pc = next((x for x in cards if x.id == c.parent_id), None)
+                    if pc:
+                        pc.children.append(c.id)
+            # 卡片深度重算 (手动重排后跟随新父链), 供布局/折叠层级判断
+            def _card_depth(cid: str, memo: Dict[str, int]) -> int:
+                if cid in memo:
+                    return memo[cid]
+                cc = next((x for x in cards if x.id == cid), None)
+                d = 0 if (not cc or not cc.parent_id) else _card_depth(cc.parent_id, memo) + 1
+                memo[cid] = d
+                return d
+            _dmemo: Dict[str, int] = {}
+            for c in cards:
+                c.depth = _card_depth(c.id, _dmemo)
+            cards.sort(key=lambda c: (c.depth, c.created_at))
+            # 2026-08-16 (显式连接图重构): 旧 JSON 首次迁移 links + 派生每卡 inputs/outputs
+            if self._links_pending_migration:
+                self._migrate_links(cards)
+                self._links_pending_migration = False
+                self.persist()
+            card_map = {c.id: c for c in cards}
+            for lk in self.links or []:
+                fc = lk.get("from_card"); tc = lk.get("to_card")
+                if fc in card_map and tc in card_map:
+                    card_map[tc].inputs.append({
+                        "id": lk.get("id"), "from_card": fc,
+                        "from_port": lk.get("from_port", "bottom"),
+                        "to_port": lk.get("to_port", "top"), "kind": lk.get("kind", "manual"),
+                    })
+                    card_map[fc].outputs.append({
+                        "id": lk.get("id"), "to_card": tc,
+                        "to_port": lk.get("to_port", "top"),
+                        "from_port": lk.get("from_port", "bottom"), "kind": lk.get("kind", "manual"),
+                    })
+            if not load_messages:
+                return cards
+            # 批量回读消息并串联 (一段连续会话)
+            all_ids = [mid for c in cards for mid in c.v5_memory_ids]
+            batch = self._load_fn(all_ids) if all_ids else {}
+            for c in cards:
+                msgs: List[Dict[str, Any]] = []
+                for nid in c.node_ids:
+                    n = self.nodes.get(nid)
+                    if not n or n.v5_memory_id <= 0:
+                        continue
+                    raw = batch.get(n.v5_memory_id, "")
+                    if raw:
+                        try:
+                            parsed = json.loads(raw)
+                            if isinstance(parsed, list):
+                                msgs.extend(parsed)
+                        except json.JSONDecodeError:
+                            msgs.append({"role": "system", "content": raw})
+                c.messages = msgs
+            return cards
+
+    def card_of_node(self, node_id: str) -> Optional["ConvCard"]:
+        """返回某节点所属卡片 (无卡片视图时 None)."""
+        for c in self.build_cards():
+            if node_id in c.node_ids:
+                return c
+        return None
+
+    # ── 2026-08-16 (显式连接图重构): 链接管理 ──
+    def _migrate_links(self, cards: List["ConvCard"]) -> None:
+        """旧模型关系迁移为显式连接 (每卡独立新模型, 一次性).
+
+        优先级: parent_override (手动挂接) → branching/parallel 来源 (建卡来源)
+        → 自动父链 (主线聚合)。统一转成 links (from 出 bottom → to 入 top)。
+        迁移后 tree.links 即事实, 后续仅用户手动连接/断开。
+        """
+        card_ids = {c.id for c in cards}
+        links: List[Dict[str, Any]] = []
+        for c in cards:
+            meta = (self.cards_meta or {}).get(c.id, {})
+            ov = meta.get("parent_override") if meta and "parent_override" in meta else None
+            if ov and ov in card_ids and ov != c.id:
+                links.append({"id": uid("lk"), "from_card": ov, "from_port": "bottom",
+                              "to_card": c.id, "to_port": "top", "kind": "manual"})
+                continue
+            src = (meta or {}).get("branching_source_id") or (meta or {}).get("parallel_source_id")
+            if src and src in card_ids and src != c.id:
+                links.append({"id": uid("lk"), "from_card": src, "from_port": "bottom",
+                              "to_card": c.id, "to_port": "top", "kind": c.kind or "branching"})
+                continue
+            if c.parent_id and c.parent_id in card_ids and c.parent_id != c.id:
+                links.append({"id": uid("lk"), "from_card": c.parent_id, "from_port": "bottom",
+                              "to_card": c.id, "to_port": "top", "kind": "auto"})
+        self.links = links
+
+    def link_cards(self, from_card: str, to_card: str, from_port: str = "bottom",
+                   to_port: str = "top", kind: str = "manual") -> Dict[str, Any]:
+        """建立显式连接 (from 出锚点 → to 入锚点). 防自连/防重复.
+
+        from_port: 'right'|'bottom' (出); to_port: 'left'|'top' (入)。
+        """
+        with self._lock:
+            card_ids = {cc.id for cc in self.build_cards(load_messages=False)}
+            if from_card not in card_ids or to_card not in card_ids:
+                raise ValueError("source or target card not found")
+            if from_card == to_card:
+                raise ValueError("cannot link a card to itself")
+            if from_port not in ("right", "bottom"):
+                from_port = "bottom"
+            if to_port not in ("left", "top"):
+                to_port = "top"
+            for lk in self.links:
+                if lk.get("from_card") == from_card and lk.get("to_card") == to_card:
+                    return lk                 # 已存在 → 幂等返回
+            link = {"id": uid("lk"), "from_card": from_card, "from_port": from_port,
+                    "to_card": to_card, "to_port": to_port, "kind": kind}
+            self.links.append(link)
+            self.version += 1
+        self._emit()
+        self.persist()
+        return link
+
+    def unlink_cards(self, link_id: Optional[str] = None,
+                     from_card: Optional[str] = None, to_card: Optional[str] = None) -> bool:
+        """断开连接 (按 link_id, 或按 from_card→to_card). 断开后卡片恢复独立."""
+        with self._lock:
+            before = len(self.links)
+            if link_id:
+                self.links = [lk for lk in self.links if lk.get("id") != link_id]
+            else:
+                self.links = [lk for lk in self.links
+                              if not (lk.get("from_card") == from_card and lk.get("to_card") == to_card)]
+            changed = len(self.links) != before
+            if changed:
+                self.version += 1
+        if changed:
+            self._emit()
+            self.persist()
+        return changed
+
+    def _anchor_node_of_message(
+        self,
+        card: "ConvCard",
+        source_message_id: Optional[str] = None,
+        source_message_index: Optional[int] = None,
+    ) -> "ConvNode":
+        """定位源消息所属节点: 消息 id 优先, 缺 id 历史消息用卡片内全局索引回退.
+
+        找不到具体消息 → 回退源卡头节点。
+        """
+        if card.node_ids:
+            global_idx = 0
+            for nid in card.node_ids:
+                n = self.nodes.get(nid)
+                if not n or n.v5_memory_id <= 0:
+                    continue
+                raw = self._load_fn([n.v5_memory_id]).get(n.v5_memory_id, "")
+                try:
+                    msgs = json.loads(raw) if raw else []
+                except json.JSONDecodeError:
+                    msgs = []
+                if not isinstance(msgs, list):
+                    msgs = []
+                for m in msgs:
+                    if source_message_id and m.get("id") == source_message_id:
+                        return n
+                    if source_message_index is not None and global_idx == source_message_index:
+                        return n
+                    global_idx += 1
+        head_id = card.id[len("card_"):]
+        return self.nodes.get(head_id) or next(iter(self.nodes.values()))
+
+    def create_card_from_message(
+        self,
+        source_card_id: str,
+        kind: str = "child",          # child | parallel | branching | manual
+        messages: Optional[List[Dict[str, Any]]] = None,
+        source_message_id: Optional[str] = None,
+        source_message_index: Optional[int] = None,
+        source_focus: str = "",
+        title: Optional[str] = None,
+        branch_label: Optional[str] = None,
+    ) -> "ConvCard":
+        """从源卡某条消息创建新卡 (2026-08-15 poker 对齐: 子卡/发散卡/分支卡).
+
+        - 定位源消息所属节点 (消息 id 优先, 历史无 id 消息用卡片内索引回退);
+        - 新建回合节点 (parent = 源消息所在节点, force_branch) → 父节点成为分叉点,
+          新节点天然成为卡片头 (自动聚合); cards_meta 记录 kind/来源标记/title/未读。
+        """
+        with self._lock:
+            src_card: Optional[ConvCard] = None
+            for c in self.build_cards(load_messages=False):
+                if c.id == source_card_id:
+                    src_card = c
+                    break
+            if src_card is None:
+                raise ValueError(f"source card not found: {source_card_id}")
+            anchor = self._anchor_node_of_message(src_card, source_message_id, source_message_index)
+            msgs = _ensure_message_ids(messages or [])
+            node = self.add_turn(
+                msgs,
+                parent_id=anchor.id,
+                branch_label=branch_label,
+                force_branch=True,
+                title=title,
+            )
+            card_id = "card_" + node.id
+            meta: Dict[str, Any] = {
+                "kind": kind if kind in ("child", "parallel", "branching", "manual") else "manual",
+                "title": title or "",
+                "source_focus": source_focus or "",
+                "is_unread": True,
+            }
+            if kind == "parallel":
+                meta["parallel_source_id"] = source_card_id
+                meta["parallel_source_message_id"] = source_message_id
+            elif kind == "branching":
+                meta["branching_source_id"] = source_card_id
+                meta["branching_source_message_id"] = source_message_id
+            elif kind == "child":
+                meta["parent_source_id"] = source_card_id
+                meta["parent_source_message_id"] = source_message_id
+            self.cards_meta[card_id] = meta
+            self.version += 1
+        self._emit()
+        self.persist()
+        return self.card_of_node(node.id)
+
+    # ── 分支链回溯 (对齐 ai.explore.poker 的 t6) ──────────────────────────
+    def get_branch_chain(self, card_id: str) -> List[Dict[str, Any]]:
+        """沿 branching_source_id 递归回溯分支继承链 (poker t6 的同构移植).
+
+        返回 [最古老祖先卡 ... 紧邻当前卡的祖先卡] 的继承消息列表:
+            [{card_id, source_card_id, at_message_id, inherited_messages}]
+        其中 inherited_messages 是"站在该链节视角, 应继承的源卡消息子集":
+          - at_message_id == "START"  → 继承 [] (从源卡开头重新开始, 不继承源卡消息)
+          - at_message_id 为具体消息 id → 继承源卡 [0 .. 该消息] (含)
+          - at_message_id 为 None      → 继承源卡全部消息 (整卡来源)
+        chat 上下文 = sum(inherited_messages, []) + 当前卡 messages。
+        """
+        with self._lock:
+            cards = {c.id: c for c in self.build_cards(load_messages=True)}
+            chain: List[Dict[str, Any]] = []
+            cur = cards.get(card_id)
+            seen: set = set()
+            while cur and cur.branching_source_id and cur.id not in seen:
+                seen.add(cur.id)
+                src = cards.get(cur.branching_source_id)
+                if src is None:
+                    break
+                at = cur.branching_source_message_id
+                if at == "START":
+                    inherited: List[Dict[str, Any]] = []
+                elif at:
+                    idx = next((i for i, m in enumerate(src.messages) if m.get("id") == at), -1)
+                    inherited = src.messages[:idx + 1] if idx >= 0 else []
+                else:
+                    inherited = list(src.messages)
+                chain.insert(0, {
+                    "card_id": cur.id,
+                    "source_card_id": src.id,
+                    "at_message_id": at,
+                    "inherited_messages": _strip_msg_ids(inherited),
+                })
+                cur = src
+            return chain
+
+    def get_branch_context(self, card_id: str) -> List[Dict[str, Any]]:
+        """分支卡的完整上下文: 所有继承链消息 + 当前卡消息 (poker fetchLLMStream 的 p)."""
+        with self._lock:
+            cards = {c.id: c for c in self.build_cards(load_messages=True)}
+            cur = cards.get(card_id)
+            if cur is None:
+                raise ValueError(f"card not found: {card_id}")
+            inherited: List[Dict[str, Any]] = []
+            for link in self.get_branch_chain(card_id):
+                inherited.extend(link["inherited_messages"])
+            return _strip_msg_ids(inherited) + _strip_msg_ids(list(cur.messages))
+
+    def set_card_branch_point(self, card_id: str, at_message_id: Optional[str]) -> "ConvCard":
+        """事后调整分支卡的分支点 (对齐 poker effectiveBranchPointId).
+
+        at_message_id: "START" (从源卡开头重来) | 源卡内某消息 id | None (整卡来源 / 清除精确锚点)。
+        校验卡片存在且为 branching 来源; 写入 cards_meta.branching_source_message_id。
+        """
+        with self._lock:
+            cards = {c.id: c for c in self.build_cards(load_messages=False)}
+            card = cards.get(card_id)
+            if card is None:
+                raise ValueError(f"card not found: {card_id}")
+            if not card.branching_source_id:
+                raise ValueError(f"card {card_id} is not a branching card (no branching_source_id)")
+            if at_message_id and at_message_id != "START":
+                src = cards.get(card.branching_source_id)
+                if src is None:
+                    raise ValueError(f"branching source card not found: {card.branching_source_id}")
+                # 校验消息 id 属于源卡
+                src_full = self.build_cards(load_messages=True)
+                src2 = next((c for c in src_full if c.id == card.branching_source_id), None)
+                if src2 is not None and not any(m.get("id") == at_message_id for m in src2.messages):
+                    raise ValueError(f"message {at_message_id} not found in source card {card.branching_source_id}")
+            meta = self.cards_meta.setdefault(card_id, {})
+            meta["branching_source_message_id"] = at_message_id
+            self.version += 1
+        self._emit()
+        self.persist()
+        return self.card_of_node(card_id[len("card_"):])
+
+    def set_card_read(self, card_id: str, is_unread: bool) -> None:
+        """设置卡片未读状态 (cards_meta 持久化)."""
+        with self._lock:
+            meta = self.cards_meta.setdefault(card_id, {})
+            meta["is_unread"] = bool(is_unread)
+            self.version += 1
+        self._emit()
+        self.persist()
+
+    def set_card_parent(self, card_id: str, parent_card_id: Optional[str] = None) -> "ConvCard":
+        """手动指定卡片父关系 (2026-08-15 科技树编排: 拖拽挂接/解除).
+
+        - parent_card_id: 目标父卡 id; None → 清除覆盖, 恢复自动派生父级。
+        - 校验: 卡存在 / 不能挂到自身 / 不能成环 (目标卡不得是 card 的后代)。
+        - 覆盖存 cards_meta["parent_override"], build_cards 应用 (节点树不动)。
+        """
+        with self._lock:
+            cards = {c.id: c for c in self.build_cards(load_messages=False)}
+            if card_id not in cards:
+                raise ValueError(f"card not found: {card_id}")
+            meta = self.cards_meta.setdefault(card_id, {})
+            if not parent_card_id:
+                meta.pop("parent_override", None)
+            else:
+                if parent_card_id == card_id:
+                    raise ValueError("cannot parent a card to itself")
+                if parent_card_id not in cards:
+                    raise ValueError(f"target card not found: {parent_card_id}")
+                # 成环检查: 沿目标卡的最终父链上溯, 不得遇到 card_id
+                cur: Optional[str] = parent_card_id
+                seen: set = set()
+                while cur:
+                    if cur == card_id:
+                        raise ValueError("cannot create a cycle")
+                    if cur in seen:
+                        break
+                    seen.add(cur)
+                    m = self.cards_meta.get(cur, {})
+                    if "parent_override" in m:
+                        cur = m.get("parent_override")
+                    else:
+                        cc = cards.get(cur)
+                        cur = cc.parent_id if cc else None
+                meta["parent_override"] = parent_card_id
+            self.version += 1
+        self._emit()
+        self.persist()
+        head_id = card_id[len("card_"):]
+        return self.card_of_node(head_id)
+
     # ── 持久化 (拓扑 + v5_memory_id + summary, 不含对话本体) ──
     def serialize(self) -> str:
         with self._lock:
@@ -1240,6 +1910,11 @@ class ConversationTree:
                 # S1: 持久化主线终点, 重启后主线语义不丢
                 "trunk_id": self.trunk_id,
                 "nodes": [n.to_dict() for n in self.nodes.values()],
+                # 2026-08-15 (poker 对齐): 手动卡片元数据 (建卡标记/分支点/未读),
+                # 缺省空 dict, 旧 JSON 兼容
+                "cards_meta": self.cards_meta or {},
+                # 2026-08-16 (显式连接图): 卡片显式连接 (多对多, 可断开)
+                "links": self.links or [],
             }
         return json.dumps(payload, ensure_ascii=False)
 
@@ -1247,11 +1922,24 @@ class ConversationTree:
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             path = self.data_dir / f"{self.persist_key}.json"
-            tmp = path.with_suffix(".json.tmp")
+            # R9: 并发持久化安全 —— persist() 在引擎锁外被调用 (R1 设计),
+            # 多线程同时写同一 .json.tmp 会互相截断, Windows 下 rename 期间
+            # 文件被占 → WinError 32, 写全部丢失。每次用唯一 tmp 名,
+            # os.replace 原子替换目标, 并发写同一目标 = 最后一次赢, 不丢文件。
+            tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:12]}.tmp")
             tmp.write_text(self.serialize(), encoding="utf-8")
-            tmp.replace(path)
+            # 2026-08-14: Windows 下目标文件可能被并发读者/杀软瞬时锁定,
+            # os.replace 抛 WinError 5 (access denied) → 短退避重试 (最多 4 次).
+            for _attempt in range(4):
+                try:
+                    tmp.replace(path)
+                    break
+                except OSError:
+                    if _attempt == 3:
+                        raise
+                    time.sleep(0.05 * (_attempt + 1))
         except Exception as exc:
-            logger.debug("persist skipped: %s", exc)
+            logger.warning("persist failed for %s: %s", self.persist_key, exc)
 
     @classmethod
     def deserialize(cls, raw: str | dict, **kwargs: Any) -> "ConversationTree":
@@ -1264,6 +1952,11 @@ class ConversationTree:
         #   优先取"从根出发的最深 trunk 链末端" (旧树主线 ≈ 首条链)。
         t.trunk_id = data.get("trunk_id")
         t.nodes = {n["id"]: ConvNode.from_dict(n) for n in data.get("nodes", [])}
+        # 2026-08-15 (poker 对齐): 手动卡片元数据 (旧 JSON 缺省空 → 纯自动聚合)
+        t.cards_meta = data.get("cards_meta") or {}
+        # 2026-08-16 (显式连接图): 显式连接; 旧 JSON 无 links → 标记待迁移 (build_cards 首次)
+        t.links = data.get("links") or []
+        t._links_pending_migration = "links" not in data
 
         # v1 → v2 自动迁移: 没有 schema 字段 → 所有节点 node_type 推断
         schema = data.get("schema", "")
@@ -1350,10 +2043,11 @@ class MemoryRetriever:
     @staticmethod
     def _default_cross_retrieve(query: str, top_k: int = 10,
                                 **kwargs: Any) -> list[dict]:
-        """默认跨分支检索: 走 v5.memory_retrieval 三路融合."""
+        """默认跨分支检索: 统一走 v5.memory_retrieval.unified_retrieve (P6 收敛)."""
         try:
             from v5 import memory_retrieval
-            return memory_retrieval.retrieve(query, top_k=top_k, **kwargs)
+            return memory_retrieval.unified_retrieve(query, scope="semantic",
+                                                     top_k=top_k, **kwargs)
         except Exception as e:
             logger.debug("cross-branch retrieve failed: %s", e)
             return []
@@ -1477,6 +2171,7 @@ class MemoryRetriever:
 __all__ = [
     "ConversationTree",
     "ConvNode",
+    "ConvCard",
     "MemoryRetriever",
     "ToolCall",
     "NodeInsight",

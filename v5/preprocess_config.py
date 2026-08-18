@@ -12,28 +12,67 @@ _CONFIG_PATH = Path(__file__).resolve().parent / "preprocess_config.yaml"
 _CACHE: dict | None = None
 
 _DEFAULTS: dict = {
+    # ⚠️ P7 (2026-08-14): _DEFAULTS 与 preprocess_config.yaml 同步 (防漂移).
+    # yaml 是权威源; 本默认值仅在 yaml 缺失/损坏时兜底, 必须与 yaml 一致,
+    # 否则回退会落到错误值 (如 min_fused_score 0.6 会把语义召回打空)。
+    # 防漂移测试: tests/test_config_alignment.py。
     # R2 节奏感知
     "rhythm": {
         "tz_offset": int(os.environ.get("IKAROS_TZ_OFFSET", "8")),  # 中国 UTC+8
-        "inject_when_recent": True,   # 即使刚聊过也注入精确数据
+        "inject_when_recent": True,
     },
     # R3 记忆多路检索
     "memory_retrieval": {
         "vector_weight": 0.7,
         "fts_weight": 0.3,
-        "time_decay_per_day": 0.05,   # fused × (1 - 0.05 × days)
-        "min_fused_score": 0.6,
+        "time_decay_per_day": 0.05,
+        "min_fused_score": 0.3,   # 2026-07-26 标定: 0.6 会把有效召回全过滤掉
         "top_k": 5,
+        "auto_route": True,
+        "graph_min_score": 0.2,
+        "frequency_weight": 0.05,
+        "reinforcement_weight": 0.10,
+        "freshness_weight": 0.08,
+        "long_term_boost": 0.05,
+        # Phase 4 全套加权
+        "base_weight_factor": 0.5,
+        "merge_reinforce_increment": 0.05,
+        "type_decay": {
+            "conversation": {"per_day": 0.05, "floor": 0.2},
+            "fact": {"per_day": 0.03, "floor": 0.4},
+            "emotion_label": {"per_day": 0.05, "floor": 0.2},
+            "emotional_event": {"per_day": 0.04, "floor": 0.3},
+            "preference": {"per_day": 0.02, "floor": 0.5},
+            "user_trait": {"per_day": 0.01, "floor": 0.6},
+            "identity": {"per_day": 0.005, "floor": 0.7},
+            "decision": {"per_day": 0.005, "floor": 0.7},
+            "lesson": {"per_day": 0.01, "floor": 0.6},
+            "convention": {"per_day": 0.005, "floor": 0.7},
+            "pitfall": {"per_day": 0.005, "floor": 0.7},
+            "default": {"per_day": 0.05, "floor": 0.2},
+        },
+        "situational": {
+            "enabled": True,
+            "project_activity_boost": 0.10,
+            "hour_match_boost": 0.05,
+        },
         "type_boost": {
-            "emotion": 1.2, "fact": 1.1, "conversation": 0.8, "default": 1.0,
+            "emotion": 1.2, "fact": 1.1, "user_trait": 1.15,
+            "preference": 1.05, "conversation": 1.0, "default": 1.0,
+        },
+        "intent": {
+            "enabled": True,
+            "why": {"decision": 1.3, "lesson": 1.1, "conversation": 1.1},
+            "when": {"conversation": 1.15, "fact": 1.1},
+            "entity": {"fact": 1.2, "preference": 1.1, "identity": 1.1},
+            "general": {},
         },
     },
-    # R4 历史摘要
+    # R4 历史摘要 (model 字段已废弃移除, 摘要固定走云端 deepseek)
     "summary": {
-        "trigger_rounds": 20,    # history 长度超过才压缩
-        "reuse_rounds": 10,      # 10 轮内复用上次摘要
-        "max_age_rounds": 30,    # 超过 30 轮旧摘要丢弃
-        "model": "local-llm",
+        "trigger_rounds": 20,
+        "reuse_rounds": 10,
+        "max_age_rounds": 30,
         "max_sentences": 3,
         "timeout_s": 5,
     },
@@ -47,8 +86,8 @@ _DEFAULTS: dict = {
         "label_model": "local-llm",
         "max_tags": 2,
         "diff_inject": True,
-        "diff_threshold": 0.3,   # |ΔP|+|ΔA|+|ΔD| 超过才注差异句
-        "debounce_seconds": 5,    # spec 4.1: 5s 内不重复注
+        "diff_threshold": 0.3,
+        "debounce_seconds": 5,
         "timeout_s": 5,
         "tag_vocab": [
             "开心", "愉悦", "平静", "低落", "难过", "焦虑", "专注",
@@ -57,17 +96,17 @@ _DEFAULTS: dict = {
     },
     # 4.3 Token 预算
     "token_budget": {
-        "min": 800, "max": 1200, "char_x": 1.0,  # char_x 是安全系数: 中文~1token/字, 其他~0.5
+        "min": 800, "max": 1200, "char_x": 1.0,
     },
-    # 运行时内存缓存 (性能优化: 削 embedding 忙时尖峰 + 进程冷启动 chroma 重开 850ms)
-    # spec 之外的哥哥优化项: 同 session query embedding 缓存 + VectorIndex 单例(每轮覆写)
+    # 运行时内存缓存
     "cache": {
         "embedding_enabled": True,
-        "embedding_max": 512,           # LRU 容量 (进程级)
-        "vector_index_singleton": True, # 复用 chroma 客户端, 不再每轮重开
-        "vector_refresh_seconds": 30,   # 最多 30s 重开一次, 拾取外部(反思循环)新增记忆
-        "retrieve_ttl_seconds": 20,    # 检索结果短 TTL: 同 query 20s 内直接返回, 跳过 embedding+chroma
+        "embedding_max": 512,
+        "vector_index_singleton": True,
+        "vector_refresh_seconds": 30,
+        "retrieve_ttl_seconds": 20,
         "retrieve_ttl_enabled": True,
+        "ontology_align_enabled": True,
     },
 }
 

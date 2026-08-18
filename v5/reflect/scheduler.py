@@ -189,7 +189,7 @@ class ReflectScheduler:
       - 注册 ReflectOp 列表
       - 单次 run_all() 按 trigger 顺序执行
       - 错误上抛 (force=False) 或收集 (force=True + continue_on_error=True)
-      - state 持久化由 caller 控制 (不藏在主控里)
+      - state 持久化: run_one 单步即落盘, run_all 结束再落盘一次 (幂等)
     """
 
     def __init__(self, ops: list[ReflectOp] | None = None,
@@ -241,7 +241,7 @@ class ReflectScheduler:
 
         V4 行为:
           - should_run 为 False 且非 force → 返 0 不跑
-          - 跑成功 → 更新 state 对应 last_run_key, 返 fn() 结果
+          - 跑成功 → 更新 state 对应 last_run_key 并立即落盘, 返 fn() 结果
           - 跑失败 → 异常上抛, state 不更新 (下次还会重试)
         """
         now = time.time()
@@ -252,6 +252,9 @@ class ReflectScheduler:
         logger.info("op %s: 开始 (interval=%ds)", op.name, op.interval_sec)
         n = op.fn()  # V4: 异常上抛, 不 try/except
         self._state = self._state.set(op.last_run_key, now)
+        # R4 (S5): run_one 独立调用 (如 Hermes on_session_end) 也落盘,
+        # 修复 last_* 只在 run_all 持久化、独立触发时永不落盘的问题
+        save_state(self._state)
         logger.info("op %s: 完成, 处理 %d 条", op.name, n)
         return n
 

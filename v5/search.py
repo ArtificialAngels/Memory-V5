@@ -100,7 +100,7 @@ CHROMA_DIR = V5_DATA_DIR / "chroma"
 # Embedding service: same as V3, uses :8587 nomic-embed-text
 # V3 fix (vector_search.py:36-43) 2026-07-05: use /embedding singular path
 EMBED_URL = os.environ.get("IKAROS_EMBED_URL", "http://127.0.0.1:8587/embedding")
-EMBED_MODEL = os.environ.get("IKAROS_EMBED_MODEL", "nomic-embed-text-v2-moe")
+EMBED_MODEL = os.environ.get("IKAROS_EMBED_MODEL", "bge-m3")
 EMBED_TIMEOUT = 10
 USER_AGENT = "ikaros-vector-search-v4/1.0 (curl-compatible)"
 
@@ -113,37 +113,74 @@ def _fetch_embedding(text: str, task: str = "query") -> Optional[list[float]]:
       - Explicit User-Agent (V3 comment records urllib UA rejection)
       - Logs on failure + returns None, does not swallow
 
-    nomic-embed-text-v2-moe task prefixes (2026-07-14):
+    V5.6 (2026-08-10): chunked embedding for long documents.
+      - :8587 llama-server physical batch limit ≈512 tokens; any longer input
+        returns HTTP 500 ("input (N tokens) is too large to process").
+      - Long memories (conversation transcripts, >~350 CJK chars) silently lost
+        their vector sync, leaving them FTS-only and harming recall.
+      - Fix: split into ≤350-char chunks, embed each with the task prefix,
+        mean-pool the vectors (standard long-text embedding practice).
+
+    历史: nomic-embed-text-v2-moe task prefixes (2026-07-14, 2026-08-14 换 bge-m3 后弃用):
       - task="query"    (semantic search)  -> "search_query: "
       - task="document" (index/re-embed)   -> "search_document: "
       Without prefix, falls to default task, causing query/document vector space
       mismatch and recall distortion.
+
+    2026-08-14: 嵌入模型已换 bge-m3 (nomic-v2-moe 在 llama.cpp 下输出全零;
+    nomic-v1.5 中文语义弱)。bge-m3 无需 document 前缀, query 按官方推荐加检索指令
+    "为这个句子生成表示以用于检索相关文章："。
     """
     import http.client
     from urllib.parse import urlparse
 
-    prefix = "search_document: " if task == "document" else "search_query: "
-    payload = (prefix + text)[:2000]
-    body = json.dumps({"content": payload}).encode("utf-8")
-    try:
-        u = urlparse(EMBED_URL)
-        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=EMBED_TIMEOUT)
-        conn.request("POST", u.path or "/", body=body, headers={
-            "Content-Type": "application/json",
-            "Host": u.netloc,
-            "User-Agent": USER_AGENT,
-        })
-        resp = conn.getresponse()
-        if resp.status != 200:
-            logger.warning("embed HTTP %d for '%s...'", resp.status, text[:30])
-            return None
-        data = json.loads(resp.read().decode("utf-8"))
-        # :8587 observed response: list: [{"index":0, "embedding":[[...]]}]
-        # Also compatible with dict shapes {"embedding":[[...]]} / {"data":[{"embedding":[...]}]}
-        return _extract_vector(data)
-    except Exception as e:
-        logger.warning("embedding failed: %s", e)
+    if task == "document":
+        prefix = ""
+    else:
+        prefix = "为这个句子生成表示以用于检索相关文章："
+    # 单块嵌入: 超长文本分块 (每块 ≤350 字符, 中文 ~500 tokens 内安全)
+    text = (text or "").strip()
+    if not text:
         return None
+    _MAX_CHUNK = 350
+    chunks = [text[i:i + _MAX_CHUNK] for i in range(0, len(text), _MAX_CHUNK)] \
+        if len(text) > _MAX_CHUNK else [text]
+
+    vectors: list[list[float]] = []
+    for chunk in chunks:
+        payload = (prefix + chunk)[:2000]
+        body = json.dumps({"content": payload}).encode("utf-8")
+        try:
+            u = urlparse(EMBED_URL)
+            conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=EMBED_TIMEOUT)
+            conn.request("POST", u.path or "/", body=body, headers={
+                "Content-Type": "application/json",
+                "Host": u.netloc,
+                "User-Agent": USER_AGENT,
+            })
+            resp = conn.getresponse()
+            if resp.status != 200:
+                logger.warning("embed HTTP %d for '%s...'", resp.status, chunk[:30])
+                conn.close()
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+            conn.close()
+            # :8587 observed response: list: [{"index":0, "embedding":[[...]]}]
+            # Also compatible with dict shapes {"embedding":[[...]]} / {"data":[{"embedding":[...]}]}
+            vec = _extract_vector(data)
+            if vec is None:
+                return None
+            vectors.append(vec)
+        except Exception as e:
+            logger.warning("embedding failed: %s", e)
+            return None
+
+    if len(vectors) == 1:
+        return vectors[0]
+    # 多块平均池化 (标准长文本嵌入做法)
+    import numpy as np
+    mean = np.mean(np.asarray(vectors, dtype=np.float32), axis=0)
+    return [float(x) for x in mean]
 
 
 def _get_embedding(text: str, task: str = "query") -> Optional[list[float]]:
@@ -365,44 +402,8 @@ def get_vector_index(persist_dir: Path | None = None, *, refresh: bool = False):
         return _VI["instance"]
 
 
-def fused_search(query: str, top_k: int = 5) -> list[dict]:
-    """Dual-path fusion: FTS5 (keyword) + ChromaDB (semantic) -> merge + deduplicate.
-
-    V3 -> V4: FTS5 via v5.store, vectors via v5.search.
-    """
-    # V5 package lives in Ikaros-memory/; insert Ikaros-memory not its parent dir
-    sys.path.insert(0, str(MEM_ROOT))
-    from v5 import store  # noqa: F401
-
-    # 1. FTS5 keyword search
-    fts_hits = store.search(query, top_k=top_k, min_weight=0.2)
-    fts_results = [{
-        "id": str(m.id), "content": m.content, "type": m.type,
-        "weight": m.weight, "score": 0.3 * (1.0 / (i + 1)), "source": "fts",
-        "pad_p": getattr(m, "pad_p", 0.0), "pad_a": getattr(m, "pad_a", 0.0),
-    } for i, m in enumerate(fts_hits)]
-
-    # 2. Vector semantic search
-    vec_results: list[dict] = []
-    try:
-        idx = get_vector_index()
-        vec_results = idx.search(query, top_k=top_k)
-        for r in vec_results:
-            r["score"] = 0.7 * r.get("score", 0)
-            r["source"] = "vector"
-    except Exception as e:
-        logger.warning("vector search skipped: %s", e)
-
-    # 3. Merge and deduplicate by id
-    seen: dict[str, dict] = {}
-    for r in fts_results + vec_results:
-        if r["id"] not in seen:
-            seen[r["id"]] = r
-        else:
-            seen[r["id"]]["score"] += r.get("score", 0)
-
-    merged = sorted(seen.values(), key=lambda x: -x.get("score", 0))
-    return merged[:top_k]
+# fused_search 已删除 (2026-08-14 P1 检索收敛): 旧双路检索实现, 检索唯一入口收敛到
+# memory_retrieval.unified_retrieve。原调用方 dissonance/metacog 已切换。
 
 
 def entity_graph_search(query: str, top_k: int = 5) -> list[dict]:
@@ -450,4 +451,5 @@ if __name__ == "__main__":
         print("Usage: python v4/search.py search <query>")
         sys.exit(1)
     q = " ".join(sys.argv[2:])
-    print(json.dumps(fused_search(q), indent=2, ensure_ascii=False))
+    from v5.memory_retrieval import unified_retrieve
+    print(json.dumps(unified_retrieve(q, top_k=5), indent=2, ensure_ascii=False))
