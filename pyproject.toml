@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ikaros-memory-v5"
+version = "5.1.0"
+description = "Ikaros V5.1 unified memory system — V4 persistence engine + V5 emotional/self-cognition/reflection"
+requires-python = ">=3.12"
+
+dependencies = [
+    "aiosqlite>=0.19",
+    "chromadb>=1.5",
+    "sqlite-vec>=0.1",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "mypy>=1.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["memory_v5*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.setuptools.package-data]
+memory_v5 = ["py.typed"]

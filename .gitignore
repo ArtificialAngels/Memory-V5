@@ -1,0 +1,9 @@
+﻿data/
+models/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.vscode/
+.idea/
+.env

@@ -1,0 +1,181 @@
+# 详细说明见 docs/scripts/core/memory_v5/v5/dissonance.md
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger("ikaros.v5.dissonance")
+
+V5_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(V5_ROOT.parent))
+
+# 只对 fact/preference 类记忆做失调检测 (identity 太核心, 先不做)
+_CHECK_TYPES = {"fact", "preference"}
+# 最小语义相似度阈值 (低于此值的旧记忆不纳入比较)
+# 2026-08-14 P1 收敛: 检索切到 unified_retrieve, score 为融合分 (真实匹配≈0.3~0.5),
+# 阈值从旧 fused_search 尺度的 0.4 调为融合尺度 0.3。
+_MIN_SIMILARITY = 0.3
+
+_NLI_PROMPT = """你是认知失调检测器。判断新信息是否与旧记忆矛盾。
+
+- 如果新信息直接否定/推翻/与旧记忆不可调和 → "contradiction"
+- 如果一致或互补 → "entailment"
+- 如果毫无关系 → "neutral"
+
+只输出一个词: entailment / contradiction / neutral
+
+旧记忆: {old}
+新信息: {new}
+"""
+
+
+def detect_dissonance(
+    content: str,
+    mem_type: str = "fact",
+    *,
+    top_k: int = 5,
+    min_similarity: float = _MIN_SIMILARITY,
+    max_nli: int = 5,
+) -> dict:
+    """检测新记忆是否与已有记忆矛盾。
+
+    Args:
+        max_nli: 最多对多少条候选做 NLI (云端调用, 有成本)。默认 5 = 与 top_k
+                 一致, 不再静默跳过 4-5 名候选 (GH audit P2-17)。检测在
+                 store._run_dissonance_detection 的异步线程里跑, 不阻塞写入。
+
+    Returns:
+        {"conflicts": [...], "checked": int, "elapsed_ms": float}
+    """
+    t0 = time.time()
+
+    if mem_type not in _CHECK_TYPES:
+        return {"conflicts": [], "checked": 0, "elapsed_ms": 0}
+
+    # 1) 语义搜索相似旧记忆 (P1 收敛: 统一走 unified_retrieve, 弃用旧 fused_search)
+    try:
+        from memory_v5.memory_retrieval import unified_retrieve
+        similar = unified_retrieve(content, top_k=top_k, scope="auto")
+    except Exception as exc:
+        logger.debug("dissonance: search failed (%s)", exc)
+        return {"conflicts": [], "checked": 0, "elapsed_ms": (time.time() - t0) * 1000}
+
+    if not similar:
+        return {"conflicts": [], "checked": 0, "elapsed_ms": (time.time() - t0) * 1000}
+
+    # 过滤低相似度
+    candidates = [
+        s for s in similar
+        if s.get("score", 0) >= min_similarity and s.get("content", "") != content
+    ]
+
+    if not candidates:
+        return {"conflicts": [], "checked": len(similar), "elapsed_ms": (time.time() - t0) * 1000}
+
+    # 2) 对每个候选做 NLI (P2-17: 上限 max_nli, 默认覆盖全部 top_k 候选)
+    conflicts = []
+    for cand in candidates[:max_nli]:
+        old_text = cand.get("content", "")
+        if not old_text:
+            continue
+        verdict = _nli_check(old_text, content)
+        if verdict == "contradiction":
+            conflicts.append({
+                "old_id": cand.get("id"),
+                "old_content": old_text[:200],
+                "old_type": cand.get("type", "?"),
+                "score": cand.get("score", 0),
+            })
+
+    elapsed_ms = (time.time() - t0) * 1000
+
+    # 3) 发现矛盾 → 写入 V5 + 返回
+    if conflicts:
+        _record_dissonance(content, conflicts)
+
+    return {
+        "conflicts": conflicts,
+        "checked": len(candidates),
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def _nli_check(old_text: str, new_text: str) -> str | None:
+    """用云端 LLM (DeepSeek) 做 NLI 判断."""
+    try:
+        from memory_v5.reflect.llm_client import call_llm
+    except Exception:
+        return None
+
+    prompt = _NLI_PROMPT.format(old=old_text[:300], new=new_text[:300])
+    try:
+        result = call_llm(prompt, "", provider="deepseek", max_tokens=16,
+                          temperature=0.0, timeout=20)
+        text = result.content.strip().lower()
+        if "entailment" in text:
+            return "entailment"
+        if "contradiction" in text:
+            return "contradiction"
+        return "neutral"
+    except Exception as exc:
+        logger.debug("dissonance: NLI failed (%s)", exc)
+        return None
+
+
+def _record_dissonance(new_content: str, conflicts: list[dict]) -> None:
+    """记录认知失调事件到 V4, 并执行两件后续 (阶段 4/5):
+
+    1) 阶段 4: 被矛盾替代的旧记忆降低 reinforcement (防反复召回冲突内容);
+    2) 阶段 5: 接 temporal_graph supersede —— 把每条 NLI 判定矛盾的旧事实
+       valid_to 置为当前时间 (时间戳失效, 非删除), 让 retrieve_temporal /
+       filter_expired_episodic 不再召回过期事实。
+    """
+    try:
+        from memory_v5 import store as store
+        old_summaries = "; ".join(
+            [c["old_content"][:60] for c in conflicts[:2]]
+        )
+        content = (
+            f"我注意到一个新信息与之前的记忆矛盾。"
+            f"新: {new_content[:100]}  旧: {old_summaries}"
+        )
+        store.store(
+            content=content,
+            type="dissonance",
+            weight=0.8,
+            tags="v5,dissonance",
+        )
+
+        # 阶段 4: reinforcement 降权 (下限 -2.0, 防止反复召回已被推翻的内容)
+        try:
+            with store.committed() as c:
+                for cf in conflicts:
+                    oid = cf.get("old_id")
+                    if oid is None:
+                        continue
+                    try:
+                        oid_i = int(oid)
+                    except (TypeError, ValueError):
+                        continue
+                    c.execute(
+                        "UPDATE memory SET reinforcement = MAX(-2.0, reinforcement - 0.5) "
+                        "WHERE id = ?", (oid_i,),
+                    )
+        except Exception as exc:
+            logger.debug("dissonance: reinforcement demote failed (%s)", exc)
+
+        # 阶段 5: supersede 接线 (temporal_graph 从"死代码"进主链路)
+        try:
+            from memory_v5.extensions.temporal_graph import resolve_dissonance_supersede
+            resolve_dissonance_supersede(new_content, conflicts)
+        except Exception as exc:
+            logger.debug("dissonance: temporal supersede skipped (%s)", exc)
+
+        logger.info("dissonance: recorded %d conflicts", len(conflicts))
+    except Exception as exc:
+        logger.debug("dissonance: v4 store failed (%s)", exc)

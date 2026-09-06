@@ -1,0 +1,153 @@
+# V5.2 思考前处理工厂 — 阈值配置
+# spec 4.2: 所有阈值集中在此, 不在代码里写死. 修改本文件即时生效(进程重启后重载).
+
+rhythm:
+  tz_offset: 8            # 本地时区偏移 (小时), 中国 UTC+8. 也可用 env IKAROS_TZ_OFFSET 覆盖
+  inject_when_recent: true
+
+memory_retrieval:
+  vector_weight: 0.7      # 向量语义分权重
+  fts_weight: 0.3         # FTS5 关键词分权重
+  time_decay_per_day: 0.05
+  min_fused_score: 0.3    # 融合分阈值, 低于此不注入 (2026-08-14 标定于 bge-m3 q8_0 1024 维; 真实语义匹配 fused≈0.3~0.5, 噪声≈0.15; 原 0.6 会把所有有效召回过滤掉导致语义召回失效；早期标定于 nomic-embed-text-v2-moe 的 0.3 在 bge-m3 下尺度不变)
+  top_k: 5
+  auto_route: true            # unified_retrieve 自动补路: semantic 不足时补图扩散 (阶段1)
+  graph_min_score: 0.2        # 图扩散补路的最低分阈值, 低于此丢弃 (防噪音)
+  frequency_weight: 0.05      # 阶段4: 高频访问记忆加分 = log2(access_count+1)*0.05, cap +0.25
+  reinforcement_weight: 0.10  # 阶段4: 用户强化记忆加分 = reinforcement*0.10, cap +0.15
+  freshness_weight: 0.08      # 阶段4: 最近 7 天访问过 → +0.08
+  long_term_boost: 0.05       # 阶段2: 永久记忆(long_term=1)小幅加分, 防被新记忆挤出
+  # ── 2026-08-14 全套加权 (记忆生命周期 Phase 4) ──
+  base_weight_factor: 0.5     # A: 写侧基础权重进评分: score × (base_weight_factor + (1-f)×weight)
+                              #    1.0 = 完全忽略基础权重(旧行为); 0.5 = 权重 0.9 记忆比 0.6 记忆高 15%
+  merge_reinforce_increment: 0.05  # C: upsert 每次合并强化 +0.05 reinforcement (被合并越多越重要)
+  type_decay:                 # B+E: 每类独立衰减 (per_day 每千分/天, floor 衰减地板)
+    conversation: {per_day: 0.05, floor: 0.2}   # 对话快衰减 (现状)
+    fact: {per_day: 0.03, floor: 0.4}
+    emotion_label: {per_day: 0.05, floor: 0.2}
+    emotional_event: {per_day: 0.04, floor: 0.3}
+    preference: {per_day: 0.02, floor: 0.5}   # 用户偏好保值
+    user_trait: {per_day: 0.01, floor: 0.6}   # 人格理解长期资产, 几乎不衰减
+    identity: {per_day: 0.005, floor: 0.7}    # 自我认同基本不衰减
+    decision: {per_day: 0.005, floor: 0.7}    # 项目决策长期保值
+    lesson: {per_day: 0.01, floor: 0.6}       # 项目教训保值
+    convention: {per_day: 0.005, floor: 0.7}
+    pitfall: {per_day: 0.005, floor: 0.7}
+    default: {per_day: 0.05, floor: 0.2}
+  situational:                # D: 情境加权 (接 context_anchor; enabled=false 则全关)
+    enabled: true
+    project_activity_boost: 0.10  # 前台窗口=写代码/IDE/终端 → 带 v5_project 标签的记忆加分
+    hour_match_boost: 0.05        # 记忆 created 的小时 ≈ 当前小时 (±1h) → 微加分 (时段联想)
+  type_boost:
+    emotion: 1.2          # 情感记忆优先
+    fact: 1.1
+    user_trait: 1.15      # 对哥哥的理解优先 (V5 新增)
+    preference: 1.05
+    conversation: 1.0     # 2026-08-10 从 0.8 调平: sync_turn 写入的跨会话记忆全是
+                          # conversation, 0.8 降权把中等相关对话(fused≈0.25-0.3)
+                          # 压到 min_fused 阈值以下, 导致跨会话对话记忆召回弱
+    default: 1.0
+  intent:                     # E: 意图驱动加权 (mnemon 借鉴): 按查询意图调类型 boost
+    enabled: true
+    why:                      # 问"为什么/原因/如何解决" → 决策/教训/对话(含因果)加权
+                              # 决策 > 教训: 问"怎么解决"时解法(decision)应优先于问题(pitfall)
+      decision: 1.3
+      lesson: 1.1
+      conversation: 1.1
+    when:                     # 问"什么时候/最近/上次" → 对话/事实(时间线)加权
+      conversation: 1.15
+      fact: 1.1
+    entity:                   # 问"什么是/关于/是谁" → 实体相关(事实/偏好/身份)加权
+      fact: 1.2
+      preference: 1.1
+      identity: 1.1
+    general: {}               # 默认无偏向
+
+summary:
+  trigger_rounds: 20      # 历史轮次超过此值才压缩旧轮
+  reuse_rounds: 10        # N 轮内复用上次摘要
+  max_age_rounds: 30      # 摘要超过此轮数旧则丢弃
+  # model: (已废弃) 摘要压缩固定走云端 deepseek (reflect.llm_client provider="deepseek")
+  max_sentences: 3
+  timeout_s: 5
+
+relationship:
+  confidence_gate: 0.7     # 置信度低于此不注入
+  inject_on_signal: true
+
+emotion:
+  label_model: local-llm
+  max_tags: 2
+  diff_inject: true
+  diff_threshold: 0.3      # |ΔP|+|ΔA|+|ΔD| 超过才注差异句
+  debounce_seconds: 5       # spec 4.1: 5s 内不重复注
+  timeout_s: 5
+  tag_vocab:                # 受控词表, 约束本地 LLM 输出便于检索
+    - 开心
+    - 愉悦
+    - 平静
+    - 低落
+    - 难过
+    - 焦虑
+    - 专注
+    - 期待
+    - 温柔
+    - 害羞
+    - 满足
+    - 生气
+    - 困惑
+    - 怀旧
+    - 无聊
+
+token_budget:
+  min: 800
+  max: 1200
+  char_x: 1.0              # 安全系数: 中文~1token/字, 其他~0.5token/字符 (非 spec 字面×2, 避免中文误裁)
+
+# 运行时内存缓存 (性能优化, 非 spec 项)
+# 效果: 削 embedding 忙时尖峰(~1s) + 进程冷启动 chroma 重开(850ms); 同 session 重复 query 命中缓存
+cache:
+  embedding_enabled: true
+  embedding_max: 512           # LRU 容量 (进程级, 跨 session 共享)
+  vector_index_singleton: true # 复用 chroma 客户端, 不再每轮重开
+  vector_refresh_seconds: 30   # 最多 30s 重开一次, 拾取反思循环等外部新增记忆
+  retrieve_ttl_seconds: 20     # 检索结果短 TTL: 同 query 20s 内直接返回, 跳过 embedding+chroma
+  retrieve_ttl_enabled: true
+  ontology_align_enabled: true  # 阶段3: 本体对齐 (difflib) 挂进实体候选 (2026-08-01 开启)
+  # ── Circuit breaker (Task 2.0.2, 2026-08-20): 嵌入 :8587 不可达时短路 ──
+  # 设计: docs/memory_v5-circuit-breaker-design.md §3.3
+  circuit_breaker_enabled:        true   # 总开关; false = 旧行为
+  circuit_breaker_threshold:      3      # 连续失败次数触发 closed → open
+  circuit_breaker_reset_seconds:  30     # open → half_open 探针冷却期
+
+# F1+F2+F4: 预算感知召回 (v5_recall 工具; OpenViking context_assembler 借鉴)
+recall:
+  max_tokens: 1600      # 单次召回注入预算上限
+  dedup_turns: 5        # 跨轮去重窗口 (近 N 轮展示过正文的记忆跳过)
+  top_k: 20             # over-fetch 候选数 (给预算装配留头)
+
+# F5: 集群新鲜度 (incremental refresh watermarks; OpenViking freshness_policy 借鉴)
+freshness:
+  refresh_ratio: 0.10   # pending/total >= 此值才 due
+  min_pending: 5        # 或 pending 绝对值 >= 此值 (小桶也能触发一次)
+
+# Validation rules (v5.validation module)
+# Each rule can be individually enabled/disabled.
+# Rules check input format, type, range, and consistency.
+validation:
+  input:
+    not_empty: {enabled: true}
+    max_length: {enabled: true}
+  memory:
+    not_empty: {enabled: true}
+    max_length: {enabled: true}
+    allowed_type: {enabled: true}
+    weight_range: {enabled: true}
+    pad_range: {enabled: true}
+  query:
+    not_empty: {enabled: true}
+    query_min_length: {enabled: true}
+    max_length: {enabled: true}
+  entity:
+    not_empty: {enabled: true}
+    entity_type: {enabled: true}
